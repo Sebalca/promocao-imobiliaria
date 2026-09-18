@@ -486,6 +486,7 @@ const Auth = (function(){
   }
 
   async function signOut(){
+    try{ LiveSync.stop(); }catch(e){}
     try{ await supaClient.auth.signOut(); }catch(e){}
     session = null; allowed = false; perms = {is_admin:false, allowed_views:[]}; projectAccess = {};
     showLogin('Sessão terminada.', false);
@@ -519,7 +520,7 @@ const Auth = (function(){
     });
   }
 
-  return { init, email, isAllowed, signOut, signIn, signUp, isAdmin, allowedViews, canEditProject };
+  return { init, email, isAllowed, signOut, signIn, signUp, isAdmin, allowedViews, canEditProject, refreshPermissions: loadPermissions };
 })();
 
 const RemoteStore = (function(){
@@ -614,20 +615,112 @@ const Store = (function(){
     notify();
   }
   function replaceAll(newProjects, seedDemoIfEmpty){
+    const prevActiveId = activeId;
+    const prevScenario = scenario;
     projects = newProjects||{};
     if(Object.keys(projects).length===0 && seedDemoIfEmpty!==false){
       const demo = buildDemoProject();
       projects[demo.id] = demo;
     }
-    activeId = Object.keys(projects)[0]||null;
-    scenario = 'base';
+    if(prevActiveId && projects[prevActiveId]){
+      // Mantém o projeto e o cenário ativos (ex: quando a lista é recarregada
+      // em tempo real) em vez de saltar sempre para o primeiro projeto.
+      activeId = prevActiveId;
+      scenario = prevScenario;
+    } else {
+      activeId = Object.keys(projects)[0]||null;
+      scenario = 'base';
+    }
     if(activeId) persist(); else try{ localStorage.setItem(LS_KEY, JSON.stringify({projects, activeId, schemaVersion:SCHEMA_VERSION})); }catch(e){}
     notify();
   }
   function pushAllRemote(){
     Object.values(projects).forEach(p=> RemoteStore.push(p.id, p));
   }
-  return {load,persist,all,active,setActive,addProject,removeProject,update,replaceAll,pushAllRemote,notify,subscribe,getScenario,setScenario};
+  function persistLocalOnly(){
+    try{ localStorage.setItem(LS_KEY, JSON.stringify({projects, activeId, schemaVersion:SCHEMA_VERSION})); }catch(e){}
+  }
+  // Aplicam uma alteração vinda do Supabase Realtime (outra sessão/utilizador) sem
+  // voltar a enviá-la para o servidor — evita eco e ecrãs que "lutam" entre si.
+  function applyRemoteUpsert(id, data){
+    projects[id] = data;
+    if(!activeId) activeId = id;
+    persistLocalOnly();
+    notify();
+  }
+  function applyRemoteRemove(id){
+    if(!(id in projects)) return;
+    delete projects[id];
+    if(activeId===id) activeId = Object.keys(projects)[0]||null;
+    persistLocalOnly();
+    notify();
+  }
+  function hasProject(id){ return id in projects; }
+  return {load,persist,all,active,setActive,addProject,removeProject,update,replaceAll,pushAllRemote,notify,subscribe,getScenario,setScenario,applyRemoteUpsert,applyRemoteRemove,hasProject};
+})();
+
+/* =========================================================================
+   LIVE SYNC — atualiza o ecrã em tempo real quando outra sessão (ou o
+   administrador, a partir da aba "Contas") altera dados no Supabase,
+   sem ser preciso atualizar a página.
+   ========================================================================= */
+const LiveSync = (function(){
+  let channels = [];
+  let started = false;
+  let refreshingAccess = false;
+
+  async function refreshAccessAndProjects(){
+    if(refreshingAccess) return; // evita corridas quando chegam vários eventos seguidos
+    refreshingAccess = true;
+    try{
+      await Auth.refreshPermissions();
+      const remote = await RemoteStore.pullAll();
+      if(remote){
+        const projects = {};
+        remote.forEach(r=>{ try{ projects[r.id] = StorageEngine.migrate(r.data); }catch(e){ projects[r.id] = r.data; } });
+        Store.replaceAll(projects, Auth.isAdmin());
+      }
+      render();
+    } finally { refreshingAccess = false; }
+  }
+
+  function start(){
+    if(started) return;
+    started = true;
+
+    const projCh = supaClient.channel('promo-projects-live')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'promo_projects' }, payload=>{
+        if(payload.eventType === 'DELETE'){
+          const oldId = payload.old && payload.old.id;
+          if(oldId) Store.applyRemoteRemove(oldId);
+          return;
+        }
+        const row = payload.new;
+        if(!row) return;
+        let data;
+        try{ data = StorageEngine.migrate(row.data); }catch(e){ data = row.data; }
+        const isNew = !Store.hasProject(row.id);
+        Store.applyRemoteUpsert(row.id, data);
+        // Um projeto novo pode significar acesso novo (RLS já filtrou) — confirma via lista de acesso também.
+        if(isNew) refreshAccessAndProjects();
+      })
+      .subscribe();
+
+    const accessCh = supaClient.channel('promo-access-live')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'promo_project_access' }, ()=> refreshAccessAndProjects())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'promo_allowed_emails' }, ()=> refreshAccessAndProjects())
+      .subscribe();
+
+    channels = [projCh, accessCh];
+  }
+
+  function stop(){
+    channels.forEach(ch=>{ try{ supaClient.removeChannel(ch); }catch(e){} });
+    channels = [];
+    started = false;
+  }
+
+  return { start, stop };
 })();
 
 /* =========================================================================
@@ -1755,7 +1848,8 @@ function openModal(innerHtml, onMount){
   const back = document.createElement('div');
   back.className = 'modal-backdrop';
   back.innerHTML = `<div class="modal">${innerHtml}</div>`;
-  back.addEventListener('click', e=>{ if(e.target===back) back.remove(); });
+  // Clicar fora da janela não a fecha — só os botões Guardar/Cancelar (evita perder
+  // dados por engano ao clicar sem querer fora da janela).
   document.body.appendChild(back);
   if(onMount) onMount(back);
   return back;
@@ -1872,12 +1966,15 @@ function viewCustos(p, cf){
 function costEditorModal(cost, onSave){
   const isNew = !cost;
   const c = cost ? Util.deepClone(cost) : {id:Util.uid(),categoria:CATEGORIAS_DEFAULT[0],subcategoria:'',descricao:'',fornecedor:'',valorBase:0,temIVA:true,taxaIVA:0.23,ivaDedutivel:'sim',percDedutivel:1,mesInicio:0,mesFim:0,distribuicao:'unico',manualValores:[],percentuais:[],observacoes:''};
+  const projActivo = Store.active();
+  const categoriasExistentes = projActivo ? projActivo.costs.map(x=>x.categoria).filter(Boolean) : [];
+  const categoriasCombo = Array.from(new Set([...CATEGORIAS_DEFAULT, ...categoriasExistentes]));
   const back = openModal(`
     <h3>${isNew?'Novo custo':'Editar custo'}</h3>
     <div class="grid cols-2" style="margin-top:10px;">
       <div class="field"><label>Categoria</label>
         <input list="catlist" id="c_categoria" value="${Util.escapeHtml(c.categoria)}">
-        <datalist id="catlist">${CATEGORIAS_DEFAULT.map(x=>`<option value="${x}">`).join('')}</datalist>
+        <datalist id="catlist">${categoriasCombo.map(x=>`<option value="${Util.escapeHtml(x)}">`).join('')}</datalist>
       </div>
       <div class="field"><label>Subcategoria</label><input id="c_subcategoria" value="${Util.escapeHtml(c.subcategoria)}"></div>
       <div class="field" style="grid-column:1/3;"><label>Descrição</label><input id="c_descricao" value="${Util.escapeHtml(c.descricao)}"></div>
@@ -3014,6 +3111,7 @@ Auth.init(async ()=>{
   }
   RemoteStore.setReady(true);
   render();
+  LiveSync.start();
 });
 </script>
 </body>
