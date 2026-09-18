@@ -397,9 +397,32 @@ const supaClient = window.supabase.createClient(SUPA_URL, SUPA_ANON_KEY);
 const Auth = (function(){
   let session = null;
   let allowed = false;
+  let perms = { is_admin:false, allowed_views:[] };
+  let projectAccess = {}; // project_id -> can_edit (só para não-admins)
 
   function email(){ return (session && session.user) ? session.user.email : null; }
   function isAllowed(){ return allowed; }
+  function isAdmin(){ return !!perms.is_admin; }
+  function allowedViews(){ return perms.allowed_views||[]; }
+  function canEditProject(projectId){
+    if(perms.is_admin) return true;
+    return !!projectAccess[projectId];
+  }
+
+  async function loadPermissions(){
+    try{
+      const { data, error } = await supaClient.rpc('promo_my_permissions');
+      if(error || !data || !data.length){ perms = {is_admin:false, allowed_views:[]}; }
+      else{ perms = { is_admin: !!data[0].is_admin, allowed_views: data[0].allowed_views||[] }; }
+    }catch(e){ perms = {is_admin:false, allowed_views:[]}; }
+    projectAccess = {};
+    if(!perms.is_admin){
+      try{
+        const { data } = await supaClient.rpc('promo_my_project_access');
+        (data||[]).forEach(r=> projectAccess[r.project_id] = !!r.can_edit);
+      }catch(e){}
+    }
+  }
 
   async function checkAllowlist(em){
     try{
@@ -464,7 +487,7 @@ const Auth = (function(){
 
   async function signOut(){
     try{ await supaClient.auth.signOut(); }catch(e){}
-    session = null; allowed = false;
+    session = null; allowed = false; perms = {is_admin:false, allowed_views:[]}; projectAccess = {};
     showLogin('Sessão terminada.', false);
   }
 
@@ -479,6 +502,7 @@ const Auth = (function(){
       showLogin('O email '+em+' não tem acesso autorizado.', true);
       return;
     }
+    await loadPermissions();
     showApp();
     await startApp();
   }
@@ -495,7 +519,7 @@ const Auth = (function(){
     });
   }
 
-  return { init, email, isAllowed, signOut, signIn, signUp };
+  return { init, email, isAllowed, signOut, signIn, signUp, isAdmin, allowedViews, canEditProject };
 })();
 
 const RemoteStore = (function(){
@@ -509,8 +533,18 @@ const RemoteStore = (function(){
   async function push(id, projData){
     if(!ready || !Auth.isAllowed()) return;
     try{
-      const { error } = await supaClient.from('promo_projects').upsert({ id, data: projData, updated_at: new Date().toISOString() });
-      if(error) console.warn('Falha ao gravar projeto no Supabase', error);
+      // Tenta atualizar uma linha existente primeiro: só exige permissão de edição,
+      // ao contrário de um upsert (que exigiria também permissão de criação).
+      const { data, error } = await supaClient.from('promo_projects')
+        .update({ data: projData, updated_at: new Date().toISOString() })
+        .eq('id', id)
+        .select('id');
+      if(error){ console.warn('Falha ao gravar projeto no Supabase', error); return; }
+      if(!data || data.length===0){
+        // Ainda não existe (projeto novo) — só o administrador tem permissão para o criar.
+        const { error: insErr } = await supaClient.from('promo_projects').insert({ id, data: projData });
+        if(insErr) console.warn('Falha ao criar projeto no Supabase', insErr);
+      }
     }catch(e){ console.warn('Falha ao gravar projeto no Supabase', e); }
   }
   async function remove(id){
@@ -579,15 +613,15 @@ const Store = (function(){
     persist();
     notify();
   }
-  function replaceAll(newProjects){
+  function replaceAll(newProjects, seedDemoIfEmpty){
     projects = newProjects||{};
-    if(Object.keys(projects).length===0){
+    if(Object.keys(projects).length===0 && seedDemoIfEmpty!==false){
       const demo = buildDemoProject();
       projects[demo.id] = demo;
     }
-    activeId = Object.keys(projects)[0];
+    activeId = Object.keys(projects)[0]||null;
     scenario = 'base';
-    persist();
+    if(activeId) persist(); else try{ localStorage.setItem(LS_KEY, JSON.stringify({projects, activeId, schemaVersion:SCHEMA_VERSION})); }catch(e){}
     notify();
   }
   function pushAllRemote(){
@@ -1543,9 +1577,17 @@ const NAV = [
   {id:'relatorios', label:'Relatórios', n:'11'},
 ];
 
-const UI = { activeView:'projetos', activeInvestorId:null, charts:{} };
+const UI = { activeView:'projetos', activeInvestorId:null, charts:{}, readOnly:false };
+
+function visibleNav(){
+  if(Auth.isAdmin()) return NAV.concat([{id:'contas', label:'Contas', n:'12'}]);
+  const allowed = Auth.allowedViews();
+  return NAV.filter(n=> allowed.includes(n.id));
+}
 
 function render(){
+  const nav = visibleNav();
+  if(!nav.some(n=>n.id===UI.activeView)) UI.activeView = nav.length ? nav[0].id : null;
   renderSidebar();
   renderTopbar();
   renderContent();
@@ -1554,7 +1596,8 @@ Store.subscribe(render);
 
 function renderSidebar(){
   const ul = document.getElementById('navlist');
-  ul.innerHTML = NAV.map(item=>`<li><button data-nav="${item.id}" class="${UI.activeView===item.id?'active':''}"><span class="n">${item.n}</span>${item.label}</button></li>`).join('');
+  const nav = visibleNav();
+  ul.innerHTML = nav.map(item=>`<li><button data-nav="${item.id}" class="${UI.activeView===item.id?'active':''}"><span class="n">${item.n}</span>${item.label}</button></li>`).join('');
   ul.querySelectorAll('button').forEach(b=> b.onclick = ()=>{ UI.activeView = b.dataset.nav; render(); });
 }
 
@@ -1564,6 +1607,14 @@ function renderTopbar(){
   const active = Store.active();
   const options = Object.values(projects).map(p=>`<option value="${p.id}" ${active&&p.id===active.id?'selected':''}>${Util.escapeHtml(p.meta.nome)}</option>`).join('');
   const scen = Store.getScenario();
+  const isAdmin = Auth.isAdmin();
+  const adminBtns = isAdmin ? `
+    <button class="tb-btn" id="btnNewProject">+ Novo projeto</button>
+    <button class="tb-btn" id="btnDuplicate">Duplicar</button>
+    <button class="tb-btn" id="btnLoadProject">Carregar projeto</button>
+    <button class="tb-btn danger" id="btnDeleteProject">Eliminar</button>
+    <input type="file" id="fileLoadProject" accept="application/json" style="display:none">
+  ` : '';
   tb.innerHTML = `
     <select id="projSelect" title="Projeto ativo">${options}</select>
     <div class="tb-scenario" id="scenPicker">
@@ -1572,12 +1623,8 @@ function renderTopbar(){
       <button data-s="pessimista" class="${scen==='pessimista'?'active':''}">Pessimista</button>
     </div>
     <div class="tb-spacer"></div>
-    <button class="tb-btn" id="btnNewProject">+ Novo projeto</button>
-    <button class="tb-btn" id="btnDuplicate">Duplicar</button>
+    ${adminBtns}
     <button class="tb-btn" id="btnSaveProject">Guardar projeto</button>
-    <button class="tb-btn" id="btnLoadProject">Carregar projeto</button>
-    <button class="tb-btn danger" id="btnDeleteProject">Eliminar</button>
-    <input type="file" id="fileLoadProject" accept="application/json" style="display:none">
     <div style="display:flex;align-items:center;gap:8px;padding-left:6px;border-left:1px solid var(--border);">
       <span class="mono" style="font-size:11px;color:var(--ink-faint);" title="Sessão iniciada com">${Util.escapeHtml(Auth.email()||'')}</span>
       <button class="tb-btn" id="btnLogout">Sair</button>
@@ -1586,50 +1633,52 @@ function renderTopbar(){
   tb.querySelector('#btnLogout').onclick = ()=> Auth.signOut();
   tb.querySelector('#projSelect').onchange = e=> Store.setActive(e.target.value);
   tb.querySelectorAll('#scenPicker button').forEach(b=> b.onclick = ()=> Store.setScenario(b.dataset.s));
-  tb.querySelector('#btnNewProject').onclick = ()=>{
-    const nome = prompt('Nome do novo projeto:', 'Novo Projeto');
-    if(nome===null) return;
-    Store.addProject(newProject(nome));
-    toast('Projeto criado.');
-  };
-  tb.querySelector('#btnDuplicate').onclick = ()=>{
-    const p = Store.active(); if(!p) return;
-    const copy = Util.deepClone(p);
-    copy.id = Util.uid(); copy.meta.nome = p.meta.nome + ' (cópia)';
-    Store.addProject(copy);
-    toast('Projeto duplicado.');
-  };
   tb.querySelector('#btnSaveProject').onclick = async ()=>{
     const p = Store.active(); if(!p) return;
     const ok = await StorageEngine.exportProject(p);
     toast(ok?'Ficheiro do projeto exportado.':'Não foi possível exportar o ficheiro.', !ok);
   };
-  tb.querySelector('#btnLoadProject').onclick = ()=> tb.querySelector('#fileLoadProject').click();
-  tb.querySelector('#fileLoadProject').onchange = async (e)=>{
-    const file = e.target.files[0]; if(!file) return;
-    try{
-      const text = await file.text();
-      const result = StorageEngine.importProjectFromText(text);
-      if(result.type==='project'){
-        if(Store.all()[result.project.id] && !confirm('Já existe um projeto com este ID. Substituir os dados existentes?')) return;
-        Store.addProject(result.project);
-        toast('Projeto carregado.');
-      } else if(result.type==='backup'){
-        if(!confirm('Isto irá importar '+Object.keys(result.projects).length+' projeto(s) do backup. Os projetos existentes com o mesmo ID serão substituídos após confirmação. Continuar?')) return;
-        Object.values(result.projects).forEach(p=> Store.all()[p.id]=p);
-        Store.persist(); Store.pushAllRemote(); render();
-        toast('Backup importado.');
+  if(isAdmin){
+    tb.querySelector('#btnNewProject').onclick = ()=>{
+      const nome = prompt('Nome do novo projeto:', 'Novo Projeto');
+      if(nome===null) return;
+      Store.addProject(newProject(nome));
+      toast('Projeto criado.');
+    };
+    tb.querySelector('#btnDuplicate').onclick = ()=>{
+      const p = Store.active(); if(!p) return;
+      const copy = Util.deepClone(p);
+      copy.id = Util.uid(); copy.meta.nome = p.meta.nome + ' (cópia)';
+      Store.addProject(copy);
+      toast('Projeto duplicado.');
+    };
+    tb.querySelector('#btnLoadProject').onclick = ()=> tb.querySelector('#fileLoadProject').click();
+    tb.querySelector('#fileLoadProject').onchange = async (e)=>{
+      const file = e.target.files[0]; if(!file) return;
+      try{
+        const text = await file.text();
+        const result = StorageEngine.importProjectFromText(text);
+        if(result.type==='project'){
+          if(Store.all()[result.project.id] && !confirm('Já existe um projeto com este ID. Substituir os dados existentes?')) return;
+          Store.addProject(result.project);
+          toast('Projeto carregado.');
+        } else if(result.type==='backup'){
+          if(!confirm('Isto irá importar '+Object.keys(result.projects).length+' projeto(s) do backup. Os projetos existentes com o mesmo ID serão substituídos após confirmação. Continuar?')) return;
+          Object.values(result.projects).forEach(p=> Store.all()[p.id]=p);
+          Store.persist(); Store.pushAllRemote(); render();
+          toast('Backup importado.');
+        }
+      }catch(err){ toast(err.message, true); }
+      e.target.value='';
+    };
+    tb.querySelector('#btnDeleteProject').onclick = ()=>{
+      const p = Store.active(); if(!p) return;
+      if(confirm('Eliminar definitivamente o projeto "'+p.meta.nome+'"? Esta ação não pode ser desfeita.')){
+        Store.removeProject(p.id);
+        toast('Projeto eliminado.');
       }
-    }catch(err){ toast(err.message, true); }
-    e.target.value='';
-  };
-  tb.querySelector('#btnDeleteProject').onclick = ()=>{
-    const p = Store.active(); if(!p) return;
-    if(confirm('Eliminar definitivamente o projeto "'+p.meta.nome+'"? Esta ação não pode ser desfeita.')){
-      Store.removeProject(p.id);
-      toast('Projeto eliminado.');
-    }
-  };
+    };
+  }
 }
 
 function computeCF(){
@@ -1640,8 +1689,18 @@ function computeCF(){
 
 function renderContent(){
   const c = document.getElementById('content');
+  if(UI.activeView==='contas'){
+    c.innerHTML = Auth.isAdmin() ? viewContas() : '<div class="empty"><h3>Sem acesso</h3></div>';
+    if(Auth.isAdmin()) wireView('contas', null, null);
+    return;
+  }
   const p = Store.active();
-  if(!p){ c.innerHTML = '<div class="empty"><h3>Sem projetos</h3><p>Crie um novo projeto para começar.</p></div>'; return; }
+  if(!p){
+    c.innerHTML = Auth.isAdmin()
+      ? '<div class="empty"><h3>Sem projetos</h3><p>Crie um novo projeto para começar.</p></div>'
+      : '<div class="empty"><h3>Sem acesso a projetos</h3><p>Ainda não lhe foi dado acesso a nenhum projeto. Contacte o administrador.</p></div>';
+    return;
+  }
   const cf = computeCF();
   const alerts = ValidationEngine.run(cf.proj, cf);
   let html = '';
@@ -1663,6 +1722,32 @@ function renderContent(){
   }
   c.innerHTML = html;
   wireView(UI.activeView, p, cf);
+  const editableViews = ['projetos','pressupostos','custos','casas','investidores','financiamento','cenarios'];
+  UI.readOnly = editableViews.includes(UI.activeView) && !Auth.isAdmin() && !Auth.canEditProject(p.id);
+  applyReadOnlyGate();
+}
+
+function applyReadOnlyGate(){
+  const c = document.getElementById('content');
+  if(!c) return;
+  if(!UI.readOnly){
+    let banner = document.getElementById('roBanner');
+    if(banner) banner.remove();
+    return;
+  }
+  c.querySelectorAll('input, select, textarea').forEach(el=>{ el.disabled = true; });
+  c.querySelectorAll('button').forEach(btn=>{
+    if(btn.dataset.roSafe) return;
+    btn.disabled = true;
+  });
+  if(!document.getElementById('roBanner')){
+    const b = document.createElement('div');
+    b.id = 'roBanner';
+    b.className = 'alert';
+    b.style.marginBottom = '12px';
+    b.textContent = 'Acesso só de leitura a este projeto — não pode alterar dados.';
+    c.insertBefore(b, c.firstChild);
+  }
 }
 
 /* ---- Modal helper ---- */
@@ -2530,6 +2615,91 @@ function viewRelatorios(p, cf){
 }
 
 /* =========================================================================
+   VIEW: CONTAS (só administrador) — gestão de emails autorizados,
+   abas a que têm acesso e projetos que podem ver/editar.
+   ========================================================================= */
+function viewContas(){
+  return `
+  <div class="view-head"><div><h2>Contas</h2><p>Gerir quem pode entrar, a que abas tem acesso e a que projetos.</p></div></div>
+  <div class="card">
+    <h3>Adicionar email autorizado</h3>
+    <div style="display:flex;gap:8px;max-width:480px;">
+      <input type="email" id="novoEmailAutorizado" placeholder="nome@exemplo.com" style="flex:1;">
+      <button class="tb-btn primary" id="btnAddEmail">Adicionar</button>
+    </div>
+    <p class="methodology" style="margin-top:10px;">A pessoa só consegue criar conta depois de o email estar aqui. Ao adicionar, ainda não tem acesso a nenhuma aba nem projeto — configure abaixo.</p>
+  </div>
+  <div id="contasListArea"><div class="empty">A carregar…</div></div>`;
+}
+
+async function loadContasList(){
+  const area = document.getElementById('contasListArea');
+  if(!area) return;
+  const [{ data: emails, error: errE }, { data: access, error: errA }] = await Promise.all([
+    supaClient.from('promo_allowed_emails').select('email,is_admin,allowed_views').order('email'),
+    supaClient.from('promo_project_access').select('project_id,email,can_edit')
+  ]);
+  if(errE){ area.innerHTML = '<div class="empty">Erro ao carregar: '+Util.escapeHtml(errE.message)+'</div>'; return; }
+  const projects = Object.values(Store.all());
+  const rows = (emails||[]).map(em=>{
+    if(em.is_admin){
+      return `<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;"><b>${Util.escapeHtml(em.email)}</b><span class="tag ok">Administrador</span></div></div>`;
+    }
+    const allowed = em.allowed_views||[];
+    const tabsHtml = NAV.map(n=>`<label class="inline"><input type="checkbox" class="viewChk" data-email="${Util.escapeHtml(em.email)}" data-view="${n.id}" ${allowed.includes(n.id)?'checked':''}> ${n.label}</label>`).join('');
+    const projRows = projects.map(p=>{
+      const acc = (access||[]).find(a=>a.project_id===p.id && a.email===em.email);
+      const val = acc ? (acc.can_edit?'edit':'view') : 'none';
+      return `<tr><td>${Util.escapeHtml(p.meta.nome)}</td><td>
+        <select class="projAccessSel" data-email="${Util.escapeHtml(em.email)}" data-project="${Util.escapeHtml(p.id)}">
+          <option value="none" ${val==='none'?'selected':''}>Sem acesso</option>
+          <option value="view" ${val==='view'?'selected':''}>Só ver</option>
+          <option value="edit" ${val==='edit'?'selected':''}>Ver e editar</option>
+        </select>
+      </td></tr>`;
+    }).join('');
+    return `
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <b>${Util.escapeHtml(em.email)}</b>
+        <button class="icon-btn danger removeEmailBtn" data-email="${Util.escapeHtml(em.email)}">Remover acesso</button>
+      </div>
+      <div class="section-sub">Abas com acesso</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px 16px;margin-bottom:10px;">${tabsHtml}</div>
+      <div class="section-sub">Acesso a projetos</div>
+      <div class="tbl-wrap"><table class="data"><tbody>${projRows||'<tr><td class="empty">Sem projetos criados ainda.</td></tr>'}</tbody></table></div>
+    </div>`;
+  }).join('');
+  area.innerHTML = rows || '<div class="empty">Nenhum email autorizado além do administrador.</div>';
+
+  area.querySelectorAll('.viewChk').forEach(cb=> cb.onchange = async ()=>{
+    const email = cb.dataset.email;
+    const checked = area.querySelectorAll('.viewChk[data-email="'+CSS.escape(email)+'"]:checked');
+    const views = Array.from(checked).map(x=>x.dataset.view);
+    const { error } = await supaClient.from('promo_allowed_emails').update({ allowed_views: views }).eq('email', email);
+    toast(error ? 'Erro ao gravar: '+error.message : 'Acesso a abas atualizado.', !!error);
+  });
+  area.querySelectorAll('.projAccessSel').forEach(sel=> sel.onchange = async ()=>{
+    const email = sel.dataset.email, projectId = sel.dataset.project, val = sel.value;
+    let error;
+    if(val==='none'){
+      ({ error } = await supaClient.from('promo_project_access').delete().eq('project_id', projectId).eq('email', email));
+    } else {
+      ({ error } = await supaClient.from('promo_project_access').upsert({ project_id: projectId, email, can_edit: val==='edit' }));
+    }
+    toast(error ? 'Erro: '+error.message : 'Acesso ao projeto atualizado.', !!error);
+  });
+  area.querySelectorAll('.removeEmailBtn').forEach(btn=> btn.onclick = async ()=>{
+    const email = btn.dataset.email;
+    if(!confirm('Remover o acesso de '+email+'? Deixa de conseguir entrar na aplicação.')) return;
+    const { error } = await supaClient.from('promo_allowed_emails').delete().eq('email', email);
+    if(error){ toast('Erro: '+error.message, true); return; }
+    toast('Email removido.');
+    loadContasList();
+  });
+}
+
+/* =========================================================================
    CHARTS
    ========================================================================= */
 function destroyCharts(){ Object.values(UI.charts).forEach(ch=>ch && ch.destroy()); UI.charts={}; }
@@ -2541,6 +2711,19 @@ function chartColors(){
 function wireView(view, p, cf){
   destroyCharts();
   const C = chartColors();
+  if(view==='contas'){
+    document.getElementById('btnAddEmail').onclick = async ()=>{
+      const em = document.getElementById('novoEmailAutorizado').value.trim().toLowerCase();
+      if(!em || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)){ toast('Email inválido.', true); return; }
+      const { error } = await supaClient.from('promo_allowed_emails').insert({ email: em, allowed_views: [] });
+      if(error){ toast('Erro ao adicionar: '+error.message, true); return; }
+      toast('Email adicionado.');
+      document.getElementById('novoEmailAutorizado').value = '';
+      loadContasList();
+    };
+    loadContasList();
+    return;
+  }
   if(view==='projetos'){
     document.getElementById('btnSaveMeta').onclick = ()=>{
       Store.update(pr=>{
@@ -2816,15 +2999,18 @@ document.getElementById('authLoginBtn').onclick = ()=> Auth.signIn(document.getE
 document.getElementById('authSignupBtn').onclick = ()=> Auth.signUp(document.getElementById('authEmail').value, document.getElementById('authPass').value);
 document.getElementById('authPass').addEventListener('keydown', e=>{ if(e.key==='Enter') document.getElementById('authLoginBtn').click(); });
 
-Store.load();
 Auth.init(async ()=>{
+  const isAdmin = Auth.isAdmin();
+  if(isAdmin) Store.load(); // cache local / semente de demonstração só para o administrador
   const remote = await RemoteStore.pullAll();
   if(remote && remote.length){
     const projects = {};
     remote.forEach(r=>{ try{ projects[r.id] = StorageEngine.migrate(r.data); }catch(e){ projects[r.id] = r.data; } });
-    Store.replaceAll(projects);
-  } else {
+    Store.replaceAll(projects, isAdmin);
+  } else if(isAdmin){
     Store.pushAllRemote();
+  } else {
+    Store.replaceAll({}, false);
   }
   RemoteStore.setReady(true);
   render();
