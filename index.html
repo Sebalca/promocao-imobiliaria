@@ -1940,6 +1940,7 @@ function viewCustos(p, cf){
       <td>${c.temIVA?Util.fmtPct(c.taxaIVA):'—'}</td>
       <td>${c.temIVA?({sim:'Sim',nao:'Não',parcial:'Parcial ('+Util.fmtPct(c.percDedutivel)+')'}[c.ivaDedutivel]):'—'}</td>
       <td>${c.distribuicao}</td>
+      <td class="num mono">${c.mesInicio}</td>
       <td class="num mono">${Util.fmtMoney0(bd.cashOut)}</td>
       <td class="row-actions">
         <button class="icon-btn" data-act="edit">Editar</button>
@@ -1958,8 +1959,8 @@ function viewCustos(p, cf){
     <div class="kpi"><div class="k-label">Nº de rubricas</div><div class="k-value">${p.costs.length}</div></div>
   </div>
   <div class="tbl-wrap"><table class="data">
-    <thead><tr><th></th><th>Categoria</th><th>Subcategoria</th><th>Descrição</th><th class="num">Valor base</th><th>Taxa IVA</th><th>IVA dedutível</th><th>Distribuição</th><th class="num">Cash-out total</th><th></th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="10" class="empty">Sem custos registados.</td></tr>'}</tbody>
+    <thead><tr><th></th><th>Categoria</th><th>Subcategoria</th><th>Descrição</th><th class="num">Valor base</th><th>Taxa IVA</th><th>IVA dedutível</th><th>Distribuição</th><th class="num">Mês início</th><th class="num">Cash-out total</th><th></th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="11" class="empty">Sem custos registados.</td></tr>'}</tbody>
   </table></div>`;
 }
 
@@ -1973,8 +1974,11 @@ function costEditorModal(cost, onSave){
     <h3>${isNew?'Novo custo':'Editar custo'}</h3>
     <div class="grid cols-2" style="margin-top:10px;">
       <div class="field"><label>Categoria</label>
-        <input list="catlist" id="c_categoria" value="${Util.escapeHtml(c.categoria)}">
-        <datalist id="catlist">${categoriasCombo.map(x=>`<option value="${Util.escapeHtml(x)}">`).join('')}</datalist>
+        <select id="c_categoria">
+          ${categoriasCombo.map(x=>`<option value="${Util.escapeHtml(x)}" ${x===c.categoria?'selected':''}>${Util.escapeHtml(x)}</option>`).join('')}
+          <option value="__nova__">+ Nova categoria…</option>
+        </select>
+        <input id="c_categoria_nova" placeholder="Nome da nova categoria" style="display:none;margin-top:6px;">
       </div>
       <div class="field"><label>Subcategoria</label><input id="c_subcategoria" value="${Util.escapeHtml(c.subcategoria)}"></div>
       <div class="field" style="grid-column:1/3;"><label>Descrição</label><input id="c_descricao" value="${Util.escapeHtml(c.descricao)}"></div>
@@ -2059,9 +2063,18 @@ function costEditorModal(cost, onSave){
     }
     modalEl.querySelector('#c_distribuicao').onchange = renderDistArea;
     renderDistArea();
+    const catSelectEl = modalEl.querySelector('#c_categoria');
+    const catNovaEl = modalEl.querySelector('#c_categoria_nova');
+    function toggleCategoriaNova(){
+      if(catSelectEl.value==='__nova__'){ catNovaEl.style.display='block'; catNovaEl.focus(); }
+      else { catNovaEl.style.display='none'; }
+    }
+    catSelectEl.onchange = toggleCategoriaNova;
+    toggleCategoriaNova();
     modalEl.closest('.modal-backdrop').querySelector('#btnCancel').onclick = closeModals;
     modalEl.closest('.modal-backdrop').querySelector('#btnSave').onclick = ()=>{
-      c.categoria = modalEl.querySelector('#c_categoria').value||'Outros';
+      const catSel = modalEl.querySelector('#c_categoria').value;
+      c.categoria = catSel==='__nova__' ? (modalEl.querySelector('#c_categoria_nova').value.trim()||'Outros') : catSel;
       c.subcategoria = modalEl.querySelector('#c_subcategoria').value;
       c.descricao = modalEl.querySelector('#c_descricao').value;
       c.fornecedor = modalEl.querySelector('#c_fornecedor').value;
