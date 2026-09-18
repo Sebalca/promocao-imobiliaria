@@ -170,21 +170,22 @@ label.inline{display:flex;align-items:center;gap:6px;font-size:12.5px;cursor:poi
 <div class="toast-wrap" id="toastWrap"></div>
 
 <div id="authOverlay" class="modal-backdrop" style="display:none;z-index:200;">
-  <div class="modal" style="max-width:380px;text-align:center;">
-    <h3 style="margin-bottom:6px;">Análise de Promoção</h3>
-    <p style="color:var(--ink-soft);font-size:12.5px;margin-bottom:18px;">Acesso restrito. Introduza o seu email para receber uma ligação de acesso.</p>
-    <div id="authFormWrap">
-      <div class="field" style="margin-bottom:12px;text-align:left;">
-        <label for="authEmail">Email</label>
-        <input type="email" id="authEmail" placeholder="nome@exemplo.com" autocomplete="email">
-      </div>
-      <button class="tb-btn primary" id="authSendBtn" style="width:100%;">Enviar ligação de acesso</button>
-      <div id="authMsg" style="font-size:12px;margin-top:12px;color:var(--ink-soft);min-height:16px;"></div>
+  <div class="modal" style="max-width:380px;">
+    <h3 style="margin-bottom:2px;">Entrar ou criar conta</h3>
+    <p style="color:var(--ink-soft);font-size:12px;margin-bottom:16px;">Acesso restrito — só quem estiver autorizado consegue criar conta ou entrar.</p>
+    <div class="field" style="margin-bottom:10px;">
+      <label for="authEmail">Email</label>
+      <input type="email" id="authEmail" placeholder="tu@email.com" autocomplete="email">
     </div>
-    <div id="authSentWrap" style="display:none;">
-      <p style="font-size:12.5px;">Enviámos uma ligação de acesso para <strong id="authSentEmail"></strong>. Abra-a neste dispositivo para entrar.</p>
-      <button class="tb-btn" id="authBackBtn">Usar outro email</button>
+    <div class="field" style="margin-bottom:14px;">
+      <label for="authPass">Palavra-passe</label>
+      <input type="password" id="authPass" placeholder="Pelo menos 6 caracteres" autocomplete="current-password">
     </div>
+    <div style="display:flex;gap:8px;">
+      <button class="tb-btn" id="authSignupBtn" style="flex:1;">Criar conta</button>
+      <button class="tb-btn primary" id="authLoginBtn" style="flex:1;">Entrar</button>
+    </div>
+    <div id="authMsg" style="font-size:12px;margin-top:14px;color:var(--ink-soft);min-height:32px;text-align:center;"></div>
   </div>
 </div>
 
@@ -419,8 +420,6 @@ const Auth = (function(){
     document.getElementById('app').classList.remove('ready');
     const ov = document.getElementById('authOverlay');
     ov.style.display = 'flex';
-    document.getElementById('authFormWrap').style.display = '';
-    document.getElementById('authSentWrap').style.display = 'none';
     setMsg(msg, isErr);
   }
   function showApp(){
@@ -428,20 +427,39 @@ const Auth = (function(){
     document.getElementById('app').classList.add('ready');
   }
 
-  async function sendLink(rawEmail){
+  function validEmail(em){ return !!em && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em); }
+
+  async function signIn(rawEmail, password){
     const em = (rawEmail||'').trim().toLowerCase();
-    if(!em || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)){
-      setMsg('Introduza um email válido.', true); return;
+    if(!validEmail(em)){ setMsg('Introduza um email válido.', true); return; }
+    if(!password){ setMsg('Introduza a palavra-passe.', true); return; }
+    setMsg('A entrar…', false);
+    const { error } = await supaClient.auth.signInWithPassword({ email: em, password });
+    if(error){
+      setMsg(error.message==='Invalid login credentials' ? 'Email ou palavra-passe incorretos.' : 'Erro ao entrar: '+error.message, true);
+      return;
     }
-    setMsg('A verificar…', false);
+    // onAuthStateChange trata da sessão a partir daqui.
+  }
+
+  async function signUp(rawEmail, password){
+    const em = (rawEmail||'').trim().toLowerCase();
+    if(!validEmail(em)){ setMsg('Introduza um email válido.', true); return; }
+    if(!password || password.length<6){ setMsg('A palavra-passe deve ter pelo menos 6 caracteres.', true); return; }
+    setMsg('A verificar autorização…', false);
     const ok = await checkAllowlist(em);
-    if(!ok){ setMsg('Este email não tem acesso autorizado.', true); return; }
-    setMsg('A enviar ligação…', false);
-    const { error } = await supaClient.auth.signInWithOtp({ email: em, options:{ emailRedirectTo: window.location.href } });
-    if(error){ setMsg('Erro ao enviar: '+error.message, true); return; }
-    document.getElementById('authFormWrap').style.display = 'none';
-    document.getElementById('authSentWrap').style.display = '';
-    document.getElementById('authSentEmail').textContent = em;
+    if(!ok){ setMsg('Este email não tem acesso autorizado. Peça ao administrador para o adicionar.', true); return; }
+    setMsg('A criar conta…', false);
+    const { data, error } = await supaClient.auth.signUp({ email: em, password });
+    if(error){
+      setMsg(/already registered|already exists/i.test(error.message) ? 'Já existe uma conta com este email. Use "Entrar".' : 'Erro ao criar conta: '+error.message, true);
+      return;
+    }
+    if(!data.session){
+      setMsg('Conta criada. Verifique o seu email para confirmar antes de entrar.', false);
+    }
+    // Se a confirmação de email estiver desativada no projeto, data.session já vem preenchida
+    // e o onAuthStateChange trata do login automaticamente.
   }
 
   async function signOut(){
@@ -477,7 +495,7 @@ const Auth = (function(){
     });
   }
 
-  return { init, email, isAllowed, signOut, sendLink };
+  return { init, email, isAllowed, signOut, signIn, signUp };
 })();
 
 const RemoteStore = (function(){
@@ -2794,12 +2812,9 @@ function wireView(view, p, cf){
 /* =========================================================================
    INICIALIZAÇÃO
    ========================================================================= */
-document.getElementById('authSendBtn').onclick = ()=> Auth.sendLink(document.getElementById('authEmail').value);
-document.getElementById('authEmail').addEventListener('keydown', e=>{ if(e.key==='Enter') Auth.sendLink(e.target.value); });
-document.getElementById('authBackBtn').onclick = ()=>{
-  document.getElementById('authFormWrap').style.display = '';
-  document.getElementById('authSentWrap').style.display = 'none';
-};
+document.getElementById('authLoginBtn').onclick = ()=> Auth.signIn(document.getElementById('authEmail').value, document.getElementById('authPass').value);
+document.getElementById('authSignupBtn').onclick = ()=> Auth.signUp(document.getElementById('authEmail').value, document.getElementById('authPass').value);
+document.getElementById('authPass').addEventListener('keydown', e=>{ if(e.key==='Enter') document.getElementById('authLoginBtn').click(); });
 
 Store.load();
 Auth.init(async ()=>{
