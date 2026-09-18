@@ -52,7 +52,8 @@ table input, table select{width:100%;padding:4px 6px;font-size:12.5px;}
 .num{font-family:var(--font-mono);font-variant-numeric:tabular-nums;}
 .mono{font-family:var(--font-mono);}
 
-#app{display:flex;min-height:100vh;}
+#app{display:none;min-height:100vh;}
+#app.ready{display:flex;}
 #sidebar{width:220px;flex:0 0 220px;background:var(--accent-ink);color:#EFF3F0;display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow-y:auto;}
 #sidebar .brand{padding:20px 18px 14px 18px;border-bottom:1px solid rgba(255,255,255,.12);}
 #sidebar .brand .b-title{font-family:var(--font-display);font-size:17px;font-weight:600;color:#fff;line-height:1.2;}
@@ -168,6 +169,26 @@ label.inline{display:flex;align-items:center;gap:6px;font-size:12.5px;cursor:poi
 </div>
 <div class="toast-wrap" id="toastWrap"></div>
 
+<div id="authOverlay" class="modal-backdrop" style="display:none;z-index:200;">
+  <div class="modal" style="max-width:380px;text-align:center;">
+    <h3 style="margin-bottom:6px;">Análise de Promoção</h3>
+    <p style="color:var(--ink-soft);font-size:12.5px;margin-bottom:18px;">Acesso restrito. Introduza o seu email para receber uma ligação de acesso.</p>
+    <div id="authFormWrap">
+      <div class="field" style="margin-bottom:12px;text-align:left;">
+        <label for="authEmail">Email</label>
+        <input type="email" id="authEmail" placeholder="nome@exemplo.com" autocomplete="email">
+      </div>
+      <button class="tb-btn primary" id="authSendBtn" style="width:100%;">Enviar ligação de acesso</button>
+      <div id="authMsg" style="font-size:12px;margin-top:12px;color:var(--ink-soft);min-height:16px;"></div>
+    </div>
+    <div id="authSentWrap" style="display:none;">
+      <p style="font-size:12.5px;">Enviámos uma ligação de acesso para <strong id="authSentEmail"></strong>. Abra-a neste dispositivo para entrar.</p>
+      <button class="tb-btn" id="authBackBtn">Usar outro email</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
@@ -366,6 +387,125 @@ function buildDemoProject(){
 }
 
 /* =========================================================================
+   AUTENTICAÇÃO E SINCRONIZAÇÃO SUPABASE
+   ========================================================================= */
+const SUPA_URL = 'https://aehitgqsfcpzuunyzpsh.supabase.co';
+const SUPA_ANON_KEY = 'sb_publishable_UezgSImwgpd_EDfi02YC_w_6sqkD2Qc';
+const supaClient = window.supabase.createClient(SUPA_URL, SUPA_ANON_KEY);
+
+const Auth = (function(){
+  let session = null;
+  let allowed = false;
+
+  function email(){ return (session && session.user) ? session.user.email : null; }
+  function isAllowed(){ return allowed; }
+
+  async function checkAllowlist(em){
+    try{
+      const { data, error } = await supaClient.rpc('promo_is_allowed', { p_email: em });
+      if(error){ console.warn('Falha ao verificar autorização', error); return false; }
+      return !!data;
+    }catch(e){ console.warn('Falha ao verificar autorização', e); return false; }
+  }
+
+  function setMsg(text, isErr){
+    const m = document.getElementById('authMsg');
+    if(!m) return;
+    m.textContent = text||'';
+    m.style.color = isErr ? 'var(--neg)' : 'var(--ink-soft)';
+  }
+
+  function showLogin(msg, isErr){
+    document.getElementById('app').classList.remove('ready');
+    const ov = document.getElementById('authOverlay');
+    ov.style.display = 'flex';
+    document.getElementById('authFormWrap').style.display = '';
+    document.getElementById('authSentWrap').style.display = 'none';
+    setMsg(msg, isErr);
+  }
+  function showApp(){
+    document.getElementById('authOverlay').style.display = 'none';
+    document.getElementById('app').classList.add('ready');
+  }
+
+  async function sendLink(rawEmail){
+    const em = (rawEmail||'').trim().toLowerCase();
+    if(!em || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)){
+      setMsg('Introduza um email válido.', true); return;
+    }
+    setMsg('A verificar…', false);
+    const ok = await checkAllowlist(em);
+    if(!ok){ setMsg('Este email não tem acesso autorizado.', true); return; }
+    setMsg('A enviar ligação…', false);
+    const { error } = await supaClient.auth.signInWithOtp({ email: em, options:{ emailRedirectTo: window.location.href } });
+    if(error){ setMsg('Erro ao enviar: '+error.message, true); return; }
+    document.getElementById('authFormWrap').style.display = 'none';
+    document.getElementById('authSentWrap').style.display = '';
+    document.getElementById('authSentEmail').textContent = em;
+  }
+
+  async function signOut(){
+    try{ await supaClient.auth.signOut(); }catch(e){}
+    session = null; allowed = false;
+    showLogin('Sessão terminada.', false);
+  }
+
+  async function resolveSession(startApp){
+    if(!session){ showLogin(); return; }
+    const em = email();
+    const ok = await checkAllowlist(em);
+    allowed = ok;
+    if(!ok){
+      try{ await supaClient.auth.signOut(); }catch(e){}
+      session = null;
+      showLogin('O email '+em+' não tem acesso autorizado.', true);
+      return;
+    }
+    showApp();
+    await startApp();
+  }
+
+  async function init(startApp){
+    const { data } = await supaClient.auth.getSession();
+    session = data.session;
+    await resolveSession(startApp);
+    supaClient.auth.onAuthStateChange(async (event, s2)=>{
+      if(event==='SIGNED_OUT'){ session=null; allowed=false; showLogin(); return; }
+      const tokenChanged = (s2 && (!session || session.access_token!==s2.access_token));
+      session = s2;
+      if(tokenChanged) await resolveSession(startApp);
+    });
+  }
+
+  return { init, email, isAllowed, signOut, sendLink };
+})();
+
+const RemoteStore = (function(){
+  let ready = false;
+  function setReady(v){ ready = v; }
+  async function pullAll(){
+    const { data, error } = await supaClient.from('promo_projects').select('id,data');
+    if(error){ console.warn('Falha ao carregar projetos do Supabase', error); return null; }
+    return data;
+  }
+  async function push(id, projData){
+    if(!ready || !Auth.isAllowed()) return;
+    try{
+      const { error } = await supaClient.from('promo_projects').upsert({ id, data: projData, updated_at: new Date().toISOString() });
+      if(error) console.warn('Falha ao gravar projeto no Supabase', error);
+    }catch(e){ console.warn('Falha ao gravar projeto no Supabase', e); }
+  }
+  async function remove(id){
+    if(!ready || !Auth.isAllowed()) return;
+    try{
+      const { error } = await supaClient.from('promo_projects').delete().eq('id', id);
+      if(error) console.warn('Falha ao eliminar projeto no Supabase', error);
+    }catch(e){ console.warn('Falha ao eliminar projeto no Supabase', e); }
+  }
+  return { setReady, pullAll, push, remove };
+})();
+
+/* =========================================================================
    STORE
    ========================================================================= */
 const Store = (function(){
@@ -379,6 +519,7 @@ const Store = (function(){
     try{
       localStorage.setItem(LS_KEY, JSON.stringify({projects, activeId, schemaVersion:SCHEMA_VERSION}));
     }catch(e){ console.warn('Falha ao gravar localStorage', e); }
+    if(activeId && projects[activeId]) RemoteStore.push(activeId, projects[activeId]);
   }
   function load(){
     try{
@@ -407,6 +548,7 @@ const Store = (function(){
   function setScenario(s){ scenario = s; notify(); }
   function addProject(p){ projects[p.id]=p; activeId=p.id; scenario='base'; persist(); notify(); }
   function removeProject(id){
+    RemoteStore.remove(id);
     delete projects[id];
     if(activeId===id) activeId = Object.keys(projects)[0]||null;
     if(!activeId){ const demo=buildDemoProject(); projects[demo.id]=demo; activeId=demo.id; }
@@ -419,7 +561,21 @@ const Store = (function(){
     persist();
     notify();
   }
-  return {load,persist,all,active,setActive,addProject,removeProject,update,notify,subscribe,getScenario,setScenario};
+  function replaceAll(newProjects){
+    projects = newProjects||{};
+    if(Object.keys(projects).length===0){
+      const demo = buildDemoProject();
+      projects[demo.id] = demo;
+    }
+    activeId = Object.keys(projects)[0];
+    scenario = 'base';
+    persist();
+    notify();
+  }
+  function pushAllRemote(){
+    Object.values(projects).forEach(p=> RemoteStore.push(p.id, p));
+  }
+  return {load,persist,all,active,setActive,addProject,removeProject,update,replaceAll,pushAllRemote,notify,subscribe,getScenario,setScenario};
 })();
 
 /* =========================================================================
@@ -1404,7 +1560,12 @@ function renderTopbar(){
     <button class="tb-btn" id="btnLoadProject">Carregar projeto</button>
     <button class="tb-btn danger" id="btnDeleteProject">Eliminar</button>
     <input type="file" id="fileLoadProject" accept="application/json" style="display:none">
+    <div style="display:flex;align-items:center;gap:8px;padding-left:6px;border-left:1px solid var(--border);">
+      <span class="mono" style="font-size:11px;color:var(--ink-faint);" title="Sessão iniciada com">${Util.escapeHtml(Auth.email()||'')}</span>
+      <button class="tb-btn" id="btnLogout">Sair</button>
+    </div>
   `;
+  tb.querySelector('#btnLogout').onclick = ()=> Auth.signOut();
   tb.querySelector('#projSelect').onchange = e=> Store.setActive(e.target.value);
   tb.querySelectorAll('#scenPicker button').forEach(b=> b.onclick = ()=> Store.setScenario(b.dataset.s));
   tb.querySelector('#btnNewProject').onclick = ()=>{
@@ -1438,7 +1599,7 @@ function renderTopbar(){
       } else if(result.type==='backup'){
         if(!confirm('Isto irá importar '+Object.keys(result.projects).length+' projeto(s) do backup. Os projetos existentes com o mesmo ID serão substituídos após confirmação. Continuar?')) return;
         Object.values(result.projects).forEach(p=> Store.all()[p.id]=p);
-        Store.persist(); render();
+        Store.persist(); Store.pushAllRemote(); render();
         toast('Backup importado.');
       }
     }catch(err){ toast(err.message, true); }
@@ -2633,8 +2794,26 @@ function wireView(view, p, cf){
 /* =========================================================================
    INICIALIZAÇÃO
    ========================================================================= */
+document.getElementById('authSendBtn').onclick = ()=> Auth.sendLink(document.getElementById('authEmail').value);
+document.getElementById('authEmail').addEventListener('keydown', e=>{ if(e.key==='Enter') Auth.sendLink(e.target.value); });
+document.getElementById('authBackBtn').onclick = ()=>{
+  document.getElementById('authFormWrap').style.display = '';
+  document.getElementById('authSentWrap').style.display = 'none';
+};
+
 Store.load();
-render();
+Auth.init(async ()=>{
+  const remote = await RemoteStore.pullAll();
+  if(remote && remote.length){
+    const projects = {};
+    remote.forEach(r=>{ try{ projects[r.id] = StorageEngine.migrate(r.data); }catch(e){ projects[r.id] = r.data; } });
+    Store.replaceAll(projects);
+  } else {
+    Store.pushAllRemote();
+  }
+  RemoteStore.setReady(true);
+  render();
+});
 </script>
 </body>
 </html>
