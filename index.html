@@ -106,6 +106,12 @@ table input, table select{width:100%;padding:4px 6px;font-size:12.5px;}
 .kpi .k-value.neg{color:var(--neg);}
 .kpi .k-value.pos{color:var(--accent-ink);}
 .kpi .k-sub{font-size:11px;color:var(--ink-faint);margin-top:4px;}
+.kpi-info{display:inline-block;margin-left:5px;width:14px;height:14px;line-height:14px;text-align:center;border-radius:50%;background:var(--border);color:var(--ink-soft);font-size:10px;font-style:normal;cursor:help;user-select:none;}
+.kpi-info:hover{background:var(--accent-soft-border);color:var(--ink);}
+table.data th.sortable{cursor:pointer;user-select:none;white-space:nowrap;}
+table.data th.sortable:hover{color:var(--ink);}
+table.data th.sortable .sort-arrow{font-size:10px;color:var(--accent-ink);margin-left:2px;}
+.mes-hint{font-size:11px;color:var(--ink-faint);margin-top:3px;}
 
 table{width:100%;border-collapse:collapse;font-size:12.5px;}
 table.data th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.03em;color:var(--ink-soft);padding:7px 8px;border-bottom:1px solid var(--border-strong);white-space:nowrap;}
@@ -252,7 +258,14 @@ const Util = (function(){
   function deepClone(o){ return JSON.parse(JSON.stringify(o)); }
   function sum(arr, fn){ return arr.reduce((a,x)=>a+(fn?fn(x):x),0); }
   function escapeHtml(s){ return (s===undefined||s===null)?'':String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  return {uid,fmtMoney,fmtMoney0,fmtPct,fmtNum,fmtDate,addMonths,monthIndex,monthLabel,clamp,deepClone,sum,escapeHtml};
+  // Mostra o número do mês junto com a data real correspondente, ex: "2 - 01/01/2026",
+  // a partir da data de início do projeto (mês 0 = 1º mês).
+  function monthWithDate(startIso, idx){
+    if(idx===null||idx===undefined||isNaN(idx)) return '—';
+    if(!startIso) return String(idx);
+    return idx + ' - ' + fmtDate(addMonths(startIso, idx));
+  }
+  return {uid,fmtMoney,fmtMoney0,fmtPct,fmtNum,fmtDate,addMonths,monthIndex,monthLabel,monthWithDate,clamp,deepClone,sum,escapeHtml};
 })();
 
 /* =========================================================================
@@ -1801,7 +1814,50 @@ const NAV = [
   {id:'relatorios', label:'Relatórios', n:'14'},
 ];
 
-const UI = { activeView:'projetos', activeInvestorId:null, charts:{}, readOnly:false };
+const UI = { activeView:'projetos', activeInvestorId:null, charts:{}, readOnly:false, tableSort:{} };
+
+// Pequeno ícone "(i)" a colocar ao lado do título de uma caixa de KPI, com uma
+// explicação/fórmula em texto (tooltip nativo ao passar o rato).
+function kpiInfo(explicacao){
+  return `<span class="kpi-info" title="${Util.escapeHtml(explicacao)}">i</span>`;
+}
+
+// Ordenação de tabelas (client-side, só para visualização): mantém o estado
+// de ordenação por vista (viewKey) em UI.tableSort, sem alterar a ordem real
+// dos dados guardados no projeto.
+function applyTableSort(viewKey, items, keyFns){
+  const st = UI.tableSort[viewKey];
+  if(!st || !st.col || !keyFns[st.col]) return items.slice();
+  const fn = keyFns[st.col];
+  const arr = items.map((it,idx)=>({it,idx}));
+  arr.sort((a,b)=>{
+    let va = fn(a.it), vb = fn(b.it);
+    if(typeof va==='string') va = va.toLowerCase();
+    if(typeof vb==='string') vb = vb.toLowerCase();
+    if(va<vb) return -1*st.dir;
+    if(va>vb) return 1*st.dir;
+    return a.idx-b.idx;
+  });
+  return arr.map(x=>x.it);
+}
+function sortTh(viewKey, col, label, extraClass){
+  const st = UI.tableSort[viewKey];
+  const active = st && st.col===col;
+  const arrow = active ? `<span class="sort-arrow">${st.dir===1?'▲':'▼'}</span>` : '';
+  return `<th class="sortable ${extraClass||''}" data-sort-view="${viewKey}" data-sort-col="${col}">${label}${arrow}</th>`;
+}
+function wireSortableHeaders(){
+  document.querySelectorAll('#content th.sortable').forEach(th=>{
+    th.onclick = ()=>{
+      const viewKey = th.dataset.sortView, col = th.dataset.sortCol;
+      const st = UI.tableSort[viewKey];
+      if(!st || st.col!==col){ UI.tableSort[viewKey] = {col, dir:1}; }
+      else if(st.dir===1){ st.dir = -1; }
+      else { delete UI.tableSort[viewKey]; }
+      render();
+    };
+  });
+}
 
 function visibleNav(){
   if(Auth.isAdmin()) return NAV;
@@ -2064,7 +2120,13 @@ function viewCustos(p, cf){
   // usa o botão "Editar" — abre o item na aba de onde ele vem.
   const totalCash = Util.sum(cf.costBreakdown, x=>x.cashOut);
   const totalEcon = Util.sum(cf.costBreakdown, x=>x.economico);
-  const items = allProjectCosts(p);
+  const itemsOriginal = allProjectCosts(p);
+  const cashOutOf = c=> (cf.costBreakdown.find(b=>b.id===c.id)||{cashOut:0}).cashOut;
+  const items = applyTableSort('custos', itemsOriginal, {
+    aba: c=>c.origem||'', categoria: c=>c.categoria||'', subcategoria: c=>c.subcategoria||'', descricao: c=>c.descricao||'',
+    valor: c=>c.valorBase||0, taxaIVA: c=>c.taxaIVA||0, distribuicao: c=>c.distribuicao||'',
+    mesInicio: c=>c.mesInicio||0, cashOut: cashOutOf
+  });
   const rows = items.map(c=>{
     const bd = cf.costBreakdown.find(b=>b.id===c.id)||{cashOut:0,economico:0};
     return `<tr data-id="${c.id}" data-origem="${c.origem}">
@@ -2076,7 +2138,7 @@ function viewCustos(p, cf){
       <td>${c.temIVA?Util.fmtPct(c.taxaIVA):'—'}</td>
       <td>${c.temIVA?({sim:'Sim',nao:'Não',parcial:'Parcial ('+Util.fmtPct(c.percDedutivel)+')'}[c.ivaDedutivel]):'—'}</td>
       <td>${c.distribuicao}</td>
-      <td class="num mono">${c.mesInicio}</td>
+      <td class="num mono">${Util.monthWithDate(p.assumptions.dataInicio, c.mesInicio)}</td>
       <td class="num mono">${Util.fmtMoney0(bd.cashOut)}</td>
       <td class="row-actions">
         <button class="icon-btn" data-act="edit">Editar</button>
@@ -2084,14 +2146,25 @@ function viewCustos(p, cf){
     </tr>`;
   }).join('');
   return `
-  <div class="view-head"><div><h2>Custos</h2><p>Lista consolidada de todos os custos do projeto — junta as rubricas de "Custos construção" e "Custos outros", que são as abas onde se adicionam, editam ou eliminam custos. Esta aba é só de consulta.</p></div></div>
+  <div class="view-head"><div><h2>Custos</h2><p>Lista consolidada de todos os custos do projeto — junta as rubricas de "Custos construção" e "Custos outros", que são as abas onde se adicionam, editam ou eliminam custos. Esta aba é só de consulta. Clica num cabeçalho de coluna para ordenar.</p></div></div>
   <div class="kpis">
     <div class="kpi"><div class="k-label">Custo total (cash-out)</div><div class="k-value">${Util.fmtMoney0(totalCash)}</div></div>
     <div class="kpi"><div class="k-label">Custo económico total</div><div class="k-value">${Util.fmtMoney0(totalEcon)}</div><div class="k-sub">exclui IVA dedutível</div></div>
     <div class="kpi"><div class="k-label">Nº de rubricas</div><div class="k-value">${items.length}</div></div>
   </div>
   <div class="tbl-wrap"><table class="data">
-    <thead><tr><th>Aba</th><th>Categoria</th><th>Subcategoria</th><th>Descrição</th><th class="num">Valor</th><th>Taxa IVA</th><th>IVA dedutível</th><th>Distribuição</th><th class="num">Mês início</th><th class="num">Cash-out total</th><th></th></tr></thead>
+    <thead><tr>
+      ${sortTh('custos','aba','Aba')}
+      ${sortTh('custos','categoria','Categoria')}
+      ${sortTh('custos','subcategoria','Subcategoria')}
+      ${sortTh('custos','descricao','Descrição')}
+      ${sortTh('custos','valor','Valor','num')}
+      ${sortTh('custos','taxaIVA','Taxa IVA','num')}
+      <th>IVA dedutível</th>
+      ${sortTh('custos','distribuicao','Distribuição')}
+      ${sortTh('custos','mesInicio','Mês início','num')}
+      ${sortTh('custos','cashOut','Cash-out total','num')}
+      <th></th></tr></thead>
     <tbody>${rows || '<tr><td colspan="11" class="empty">Sem custos registados. Adiciona em "Custos construção" ou "Custos outros".</td></tr>'}</tbody>
   </table></div>`;
 }
@@ -2102,17 +2175,24 @@ function viewCustos(p, cf){
    ver "Análise construção")
    ========================================================================= */
 function viewCustosConstrucao(p){
-  const items = p.construcaoCustos||[];
-  const totalVenda = Util.sum(items, x=>x.valorVenda||0);
-  const totalConstrucao = Util.sum(items, x=>x.valorConstrucao||0);
+  const itemsOriginal = p.construcaoCustos||[];
+  const totalVenda = Util.sum(itemsOriginal, x=>x.valorVenda||0);
+  const totalConstrucao = Util.sum(itemsOriginal, x=>x.valorConstrucao||0);
+  const sortAtivo = !!(UI.tableSort.custosConstrucao && UI.tableSort.custosConstrucao.col);
+  const items = applyTableSort('custosConstrucao', itemsOriginal, {
+    categoria: c=>c.categoria||'', subcategoria: c=>c.subcategoria||'', descricao: c=>c.descricao||'',
+    valorVenda: c=>c.valorVenda||0, valorConstrucao: c=>c.valorConstrucao||0,
+    lucro: c=>(c.valorVenda||0)-(c.valorConstrucao||0), distribuicao: c=>c.distribuicao||'', mesInicio: c=>c.mesInicio||0
+  });
   const rows = items.map((c,idx)=>{
     const lucro = (c.valorVenda||0)-(c.valorConstrucao||0);
+    const realIdx = itemsOriginal.indexOf(c);
     return `<tr data-id="${c.id}">
       <td class="num mono" style="color:var(--ink-faint);">
-        <div style="display:flex;align-items:center;gap:2px;">
-          <button class="icon-btn" data-act="up" title="Mover para cima" ${idx===0?'disabled':''}>↑</button>
-          <button class="icon-btn" data-act="down" title="Mover para baixo" ${idx===items.length-1?'disabled':''}>↓</button>
-        </div>
+        ${sortAtivo ? '—' : `<div style="display:flex;align-items:center;gap:2px;">
+          <button class="icon-btn" data-act="up" title="Mover para cima" ${realIdx===0?'disabled':''}>↑</button>
+          <button class="icon-btn" data-act="down" title="Mover para baixo" ${realIdx===itemsOriginal.length-1?'disabled':''}>↓</button>
+        </div>`}
       </td>
       <td>${Util.escapeHtml(c.categoria)}</td>
       <td>${Util.escapeHtml(c.subcategoria||'')}</td>
@@ -2121,16 +2201,17 @@ function viewCustosConstrucao(p){
       <td class="num mono">${Util.fmtMoney0(c.valorConstrucao)}</td>
       <td class="num mono" style="${lucro<0?'color:var(--neg)':''}">${Util.fmtMoney0(lucro)}</td>
       <td>${c.distribuicao}</td>
-      <td class="num mono">${c.mesInicio}</td>
+      <td class="num mono">${Util.monthWithDate(p.assumptions.dataInicio, c.mesInicio)}</td>
       <td class="row-actions">
         <button class="icon-btn" data-act="edit">Editar</button>
+        <button class="icon-btn" data-act="move" title="Mover para 'Custos outros'">Mover →</button>
         <button class="icon-btn" data-act="dup">Duplicar</button>
         <button class="icon-btn danger" data-act="del">Eliminar</button>
       </td>
     </tr>`;
   }).join('');
   return `
-  <div class="view-head"><div><h2>Custos construção</h2><p>Custos de obra do projeto: cada rubrica tem um valor de venda (que conta como custo no cash-flow geral, tal como qualquer outro custo) e um valor de construção (só para acompanhar a margem em "Análise construção").</p></div>
+  <div class="view-head"><div><h2>Custos construção</h2><p>Custos de obra do projeto: cada rubrica tem um valor de venda (que conta como custo no cash-flow geral, tal como qualquer outro custo) e um valor de construção (só para acompanhar a margem em "Análise construção"). Clica num cabeçalho de coluna para ordenar.</p></div>
     <button class="tb-btn primary" id="btnAddCustoConstrucao">+ Adicionar custo</button>
   </div>
   <div class="kpis">
@@ -2140,7 +2221,16 @@ function viewCustosConstrucao(p){
     <div class="kpi"><div class="k-label">Nº de rubricas</div><div class="k-value">${items.length}</div></div>
   </div>
   <div class="tbl-wrap"><table class="data">
-    <thead><tr><th></th><th>Categoria</th><th>Subcategoria</th><th>Descrição</th><th class="num">Valor de venda</th><th class="num">Valor de construção</th><th class="num">Lucro</th><th>Distribuição</th><th class="num">Mês início</th><th></th></tr></thead>
+    <thead><tr><th></th>
+      ${sortTh('custosConstrucao','categoria','Categoria')}
+      ${sortTh('custosConstrucao','subcategoria','Subcategoria')}
+      ${sortTh('custosConstrucao','descricao','Descrição')}
+      ${sortTh('custosConstrucao','valorVenda','Valor de venda','num')}
+      ${sortTh('custosConstrucao','valorConstrucao','Valor de construção','num')}
+      ${sortTh('custosConstrucao','lucro','Lucro','num')}
+      ${sortTh('custosConstrucao','distribuicao','Distribuição')}
+      ${sortTh('custosConstrucao','mesInicio','Mês início','num')}
+      <th></th></tr></thead>
     <tbody>${rows || '<tr><td colspan="10" class="empty">Sem custos de construção registados.</td></tr>'}</tbody>
   </table></div>`;
 }
@@ -2174,8 +2264,10 @@ function custoConstrucaoEditorModal(cost, onSave){
         <option value="parcial" ${c.ivaDedutivel==='parcial'?'selected':''}>Parcial</option>
       </select></div>
       <div class="field"><label>% dedutível (se parcial)</label><input type="number" step="0.01" id="cc_percDedutivel" value="${(c.percDedutivel*100).toFixed(0)}"></div>
-      <div class="field"><label>Mês de início (0 = 1º mês do projeto)</label><input type="number" id="cc_mesInicio" value="${c.mesInicio}"></div>
-      <div class="field"><label>Mês de fim</label><input type="number" id="cc_mesFim" value="${c.mesFim}"></div>
+      <div class="field" style="grid-column:1/3;display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div class="field"><label>Mês de início (0 = 1º mês do projeto)</label><input type="number" id="cc_mesInicio" value="${c.mesInicio}"><div class="mes-hint" id="cc_mesInicioHint"></div></div>
+        <div class="field"><label>Mês de fim</label><input type="number" id="cc_mesFim" value="${c.mesFim}"><div class="mes-hint" id="cc_mesFimHint"></div></div>
+      </div>
       <div class="field"><label>Forma de distribuição</label><select id="cc_distribuicao">
         <option value="unico" ${c.distribuicao==='unico'?'selected':''}>Pagamento único</option>
         <option value="igual" ${c.distribuicao==='igual'?'selected':''}>Distribuição igual pelos meses</option>
@@ -2247,6 +2339,15 @@ function custoConstrucaoEditorModal(cost, onSave){
     }
     catSelectEl.onchange = toggleCategoriaNova;
     toggleCategoriaNova();
+    const projStart = Store.active() ? Store.active().assumptions.dataInicio : null;
+    const ccMesInicioEl = modalEl.querySelector('#cc_mesInicio'), ccMesFimEl = modalEl.querySelector('#cc_mesFim');
+    function updateMesHints(){
+      modalEl.querySelector('#cc_mesInicioHint').textContent = projStart ? Util.fmtDate(Util.addMonths(projStart, +ccMesInicioEl.value||0)) : '';
+      modalEl.querySelector('#cc_mesFimHint').textContent = projStart ? Util.fmtDate(Util.addMonths(projStart, +ccMesFimEl.value||0)) : '';
+    }
+    ccMesInicioEl.oninput = updateMesHints;
+    ccMesFimEl.oninput = updateMesHints;
+    updateMesHints();
     modalEl.closest('.modal-backdrop').querySelector('#btnCancel').onclick = closeModals;
     modalEl.closest('.modal-backdrop').querySelector('#btnSave').onclick = ()=>{
       const catSel = modalEl.querySelector('#cc_categoria').value;
@@ -2275,17 +2376,24 @@ function custoConstrucaoEditorModal(cost, onSave){
    em vez de "valor de construção" — para custos que não são de obra)
    ========================================================================= */
 function viewCustosOutros(p){
-  const items = p.custosOutros||[];
-  const totalVenda = Util.sum(items, x=>x.valorVenda||0);
-  const totalCompra = Util.sum(items, x=>x.valorCompra||0);
+  const itemsOriginal = p.custosOutros||[];
+  const totalVenda = Util.sum(itemsOriginal, x=>x.valorVenda||0);
+  const totalCompra = Util.sum(itemsOriginal, x=>x.valorCompra||0);
+  const sortAtivo = !!(UI.tableSort.custosOutros && UI.tableSort.custosOutros.col);
+  const items = applyTableSort('custosOutros', itemsOriginal, {
+    categoria: c=>c.categoria||'', subcategoria: c=>c.subcategoria||'', descricao: c=>c.descricao||'',
+    valorVenda: c=>c.valorVenda||0, valorCompra: c=>c.valorCompra||0,
+    lucro: c=>(c.valorVenda||0)-(c.valorCompra||0), distribuicao: c=>c.distribuicao||'', mesInicio: c=>c.mesInicio||0
+  });
   const rows = items.map((c,idx)=>{
     const lucro = (c.valorVenda||0)-(c.valorCompra||0);
+    const realIdx = itemsOriginal.indexOf(c);
     return `<tr data-id="${c.id}">
       <td class="num mono" style="color:var(--ink-faint);">
-        <div style="display:flex;align-items:center;gap:2px;">
-          <button class="icon-btn" data-act="up" title="Mover para cima" ${idx===0?'disabled':''}>↑</button>
-          <button class="icon-btn" data-act="down" title="Mover para baixo" ${idx===items.length-1?'disabled':''}>↓</button>
-        </div>
+        ${sortAtivo ? '—' : `<div style="display:flex;align-items:center;gap:2px;">
+          <button class="icon-btn" data-act="up" title="Mover para cima" ${realIdx===0?'disabled':''}>↑</button>
+          <button class="icon-btn" data-act="down" title="Mover para baixo" ${realIdx===itemsOriginal.length-1?'disabled':''}>↓</button>
+        </div>`}
       </td>
       <td>${Util.escapeHtml(c.categoria)}</td>
       <td>${Util.escapeHtml(c.subcategoria||'')}</td>
@@ -2294,16 +2402,17 @@ function viewCustosOutros(p){
       <td class="num mono">${Util.fmtMoney0(c.valorCompra)}</td>
       <td class="num mono" style="${lucro<0?'color:var(--neg)':''}">${Util.fmtMoney0(lucro)}</td>
       <td>${c.distribuicao}</td>
-      <td class="num mono">${c.mesInicio}</td>
+      <td class="num mono">${Util.monthWithDate(p.assumptions.dataInicio, c.mesInicio)}</td>
       <td class="row-actions">
         <button class="icon-btn" data-act="edit">Editar</button>
+        <button class="icon-btn" data-act="move" title="Mover para 'Custos construção'">Mover →</button>
         <button class="icon-btn" data-act="dup">Duplicar</button>
         <button class="icon-btn danger" data-act="del">Eliminar</button>
       </td>
     </tr>`;
   }).join('');
   return `
-  <div class="view-head"><div><h2>Custos outros</h2><p>Restantes rubricas de custo do projeto (não ligadas diretamente à obra), com o mesmo modelo de "Custos construção": valor de venda e valor de compra por rubrica.</p></div>
+  <div class="view-head"><div><h2>Custos outros</h2><p>Restantes rubricas de custo do projeto (não ligadas diretamente à obra), com o mesmo modelo de "Custos construção": valor de venda e valor de compra por rubrica. Clica num cabeçalho de coluna para ordenar.</p></div>
     <button class="tb-btn primary" id="btnAddCustoOutro">+ Adicionar custo</button>
   </div>
   <div class="kpis">
@@ -2313,7 +2422,16 @@ function viewCustosOutros(p){
     <div class="kpi"><div class="k-label">Nº de rubricas</div><div class="k-value">${items.length}</div></div>
   </div>
   <div class="tbl-wrap"><table class="data">
-    <thead><tr><th></th><th>Categoria</th><th>Subcategoria</th><th>Descrição</th><th class="num">Valor de venda</th><th class="num">Valor de compra</th><th class="num">Lucro</th><th>Distribuição</th><th class="num">Mês início</th><th></th></tr></thead>
+    <thead><tr><th></th>
+      ${sortTh('custosOutros','categoria','Categoria')}
+      ${sortTh('custosOutros','subcategoria','Subcategoria')}
+      ${sortTh('custosOutros','descricao','Descrição')}
+      ${sortTh('custosOutros','valorVenda','Valor de venda','num')}
+      ${sortTh('custosOutros','valorCompra','Valor de compra','num')}
+      ${sortTh('custosOutros','lucro','Lucro','num')}
+      ${sortTh('custosOutros','distribuicao','Distribuição')}
+      ${sortTh('custosOutros','mesInicio','Mês início','num')}
+      <th></th></tr></thead>
     <tbody>${rows || '<tr><td colspan="10" class="empty">Sem custos registados.</td></tr>'}</tbody>
   </table></div>`;
 }
@@ -2347,8 +2465,10 @@ function custoOutroEditorModal(cost, onSave){
         <option value="parcial" ${c.ivaDedutivel==='parcial'?'selected':''}>Parcial</option>
       </select></div>
       <div class="field"><label>% dedutível (se parcial)</label><input type="number" step="0.01" id="co_percDedutivel" value="${(c.percDedutivel*100).toFixed(0)}"></div>
-      <div class="field"><label>Mês de início (0 = 1º mês do projeto)</label><input type="number" id="co_mesInicio" value="${c.mesInicio}"></div>
-      <div class="field"><label>Mês de fim</label><input type="number" id="co_mesFim" value="${c.mesFim}"></div>
+      <div class="field" style="grid-column:1/3;display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div class="field"><label>Mês de início (0 = 1º mês do projeto)</label><input type="number" id="co_mesInicio" value="${c.mesInicio}"><div class="mes-hint" id="co_mesInicioHint"></div></div>
+        <div class="field"><label>Mês de fim</label><input type="number" id="co_mesFim" value="${c.mesFim}"><div class="mes-hint" id="co_mesFimHint"></div></div>
+      </div>
       <div class="field"><label>Forma de distribuição</label><select id="co_distribuicao">
         <option value="unico" ${c.distribuicao==='unico'?'selected':''}>Pagamento único</option>
         <option value="igual" ${c.distribuicao==='igual'?'selected':''}>Distribuição igual pelos meses</option>
@@ -2420,6 +2540,15 @@ function custoOutroEditorModal(cost, onSave){
     }
     catSelectEl.onchange = toggleCategoriaNova;
     toggleCategoriaNova();
+    const projStart = Store.active() ? Store.active().assumptions.dataInicio : null;
+    const coMesInicioEl = modalEl.querySelector('#co_mesInicio'), coMesFimEl = modalEl.querySelector('#co_mesFim');
+    function updateMesHints(){
+      modalEl.querySelector('#co_mesInicioHint').textContent = projStart ? Util.fmtDate(Util.addMonths(projStart, +coMesInicioEl.value||0)) : '';
+      modalEl.querySelector('#co_mesFimHint').textContent = projStart ? Util.fmtDate(Util.addMonths(projStart, +coMesFimEl.value||0)) : '';
+    }
+    coMesInicioEl.oninput = updateMesHints;
+    coMesFimEl.oninput = updateMesHints;
+    updateMesHints();
     modalEl.closest('.modal-backdrop').querySelector('#btnCancel').onclick = closeModals;
     modalEl.closest('.modal-backdrop').querySelector('#btnSave').onclick = ()=>{
       const catSel = modalEl.querySelector('#co_categoria').value;
@@ -2454,10 +2583,10 @@ function viewAnaliseConstrucao(p, cf){
   return `
   <div class="view-head"><div><h2>Análise construção</h2><p>Margem (venda vs. construção) por rubrica e por categoria, com base nas rubricas da aba "Custos construção". O "valor de venda" de cada rubrica é o mesmo que conta como custo no cash-flow geral do projeto.</p></div></div>
   <div class="kpis">
-    <div class="kpi"><div class="k-label">Total de venda</div><div class="k-value">${Util.fmtMoney0(ce.totalVenda)}</div></div>
-    <div class="kpi"><div class="k-label">Total de construção</div><div class="k-value">${Util.fmtMoney0(ce.totalConstrucao)}</div></div>
-    <div class="kpi"><div class="k-label">Lucro total</div><div class="k-value ${ce.totalLucro<0?'neg':'pos'}">${Util.fmtMoney0(ce.totalLucro)}</div></div>
-    <div class="kpi"><div class="k-label">Margem</div><div class="k-value">${margem!==null?Util.fmtPct(margem):'—'}</div></div>
+    <div class="kpi"><div class="k-label">Total de venda${kpiInfo('Soma do "valor de venda" de todas as rubricas de Custos construção. É este valor que conta como custo real no cash-flow geral do projeto. Fórmula: Σ valorVenda de cada rubrica.')}</div><div class="k-value">${Util.fmtMoney0(ce.totalVenda)}</div></div>
+    <div class="kpi"><div class="k-label">Total de construção${kpiInfo('Soma do "valor de construção" de todas as rubricas — o custo real de obra, só usado para calcular a margem nesta aba (não entra no cash-flow geral). Fórmula: Σ valorConstrucao de cada rubrica.')}</div><div class="k-value">${Util.fmtMoney0(ce.totalConstrucao)}</div></div>
+    <div class="kpi"><div class="k-label">Lucro total${kpiInfo('Diferença entre o valor de venda e o valor de construção de todas as rubricas. Fórmula: Total de venda − Total de construção.')}</div><div class="k-value ${ce.totalLucro<0?'neg':'pos'}">${Util.fmtMoney0(ce.totalLucro)}</div></div>
+    <div class="kpi"><div class="k-label">Margem${kpiInfo('Lucro total em percentagem do valor de venda. Fórmula: Lucro total ÷ Total de venda.')}</div><div class="k-value">${margem!==null?Util.fmtPct(margem):'—'}</div></div>
   </div>
   <div class="card"><h3>Cash-flow da construção (venda vs construção, mensal e acumulado)</h3><div class="chart-box"><canvas id="chartConstrucaoCF"></canvas></div></div>
   <div class="card"><h3>Venda, construção e lucro por categoria</h3><div class="chart-box"><canvas id="chartConstrucaoCat"></canvas></div></div>
@@ -2709,6 +2838,7 @@ function applyPaymentPlanModal(phases, onApply){
 
 function phasesManagerModal(project, onSave){
   const phases = Util.deepClone(project.phases);
+  const projStart = project.assumptions.dataInicio;
   openModal(`
     <h3>Gerir fases</h3>
     <p style="color:var(--ink-soft);font-size:12px;">A data de venda de uma fase é aplicada, ao guardar, a todas as casas dessa fase (substitui a data prevista de venda de cada casa).</p>
@@ -2721,14 +2851,14 @@ function phasesManagerModal(project, onSave){
       wrap.innerHTML = phases.map((f,i)=>`
         <div class="grid cols-5" style="margin-bottom:6px;align-items:end;">
           <div class="field"><label>Nome</label><input class="f-nome" data-i="${i}" value="${Util.escapeHtml(f.nome)}" placeholder="Nome"></div>
-          <div class="field"><label>Mês início</label><input type="number" class="f-ini" data-i="${i}" value="${f.mesInicio}" placeholder="Mês início"></div>
-          <div class="field"><label>Mês fim</label><input type="number" class="f-fim" data-i="${i}" value="${f.mesFim}" placeholder="Mês fim"></div>
+          <div class="field"><label>Mês início</label><input type="number" class="f-ini" data-i="${i}" value="${f.mesInicio}" placeholder="Mês início"><div class="mes-hint f-ini-hint" data-i="${i}">${Util.fmtDate(Util.addMonths(projStart, f.mesInicio))}</div></div>
+          <div class="field"><label>Mês fim</label><input type="number" class="f-fim" data-i="${i}" value="${f.mesFim}" placeholder="Mês fim"><div class="mes-hint f-fim-hint" data-i="${i}">${Util.fmtDate(Util.addMonths(projStart, f.mesFim))}</div></div>
           <div class="field"><label>Data de venda (aplica a todas as casas)</label><input type="date" class="f-data" data-i="${i}" value="${f.dataVendaPrevista||''}"></div>
           <button class="icon-btn danger" data-i="${i}" id="rmPhase">Remover</button>
         </div>`).join('');
       wrap.querySelectorAll('.f-nome').forEach(el=>el.onchange=()=>phases[+el.dataset.i].nome=el.value);
-      wrap.querySelectorAll('.f-ini').forEach(el=>el.onchange=()=>phases[+el.dataset.i].mesInicio=+el.value);
-      wrap.querySelectorAll('.f-fim').forEach(el=>el.onchange=()=>phases[+el.dataset.i].mesFim=+el.value);
+      wrap.querySelectorAll('.f-ini').forEach(el=>el.oninput=()=>{ const i=+el.dataset.i; phases[i].mesInicio=+el.value||0; wrap.querySelector(`.f-ini-hint[data-i="${i}"]`).textContent = Util.fmtDate(Util.addMonths(projStart, phases[i].mesInicio)); });
+      wrap.querySelectorAll('.f-fim').forEach(el=>el.oninput=()=>{ const i=+el.dataset.i; phases[i].mesFim=+el.value||0; wrap.querySelector(`.f-fim-hint[data-i="${i}"]`).textContent = Util.fmtDate(Util.addMonths(projStart, phases[i].mesFim)); });
       wrap.querySelectorAll('.f-data').forEach(el=>el.onchange=()=>phases[+el.dataset.i].dataVendaPrevista=el.value);
       wrap.querySelectorAll('#rmPhase').forEach(btn=>btn.onclick=()=>{ phases.splice(+btn.dataset.i,1); paint(); });
     }
@@ -3011,10 +3141,10 @@ function viewCashflow(p, cf){
   return `
   <div class="view-head"><div><h2>Cash-Flow Mensal</h2><p>Linha temporal completa do projeto, do primeiro ao último mês com movimento, apenas com o que foi introduzido (custos, vendas, financiamento, investidores) — o saldo pode ficar negativo se o projeto estiver, nesse momento, por financiar. No final, se sobrar saldo positivo, é distribuído ao promotor. Clica numa linha da tabela para ver o detalhe do mês. Cenário: <strong>${Store.getScenario()}</strong>.</p></div></div>
   <div class="kpis">
-    <div class="kpi"><div class="k-label">Necessidade de capital sem financiamento</div><div class="k-value neg">${Util.fmtMoney0(cf.capitalNecessario)}</div><div class="k-sub">pior défice antes de investidores/banco — mês ${Util.monthLabel(cf.start,cf.mesPiorCapital)}</div></div>
-    <div class="kpi"><div class="k-label">Pior saldo acumulado</div><div class="k-value ${Math.min(...cf.cfAcumulado)<-1?'neg':'pos'}">${Util.fmtMoney0(Math.min(...cf.cfAcumulado))}</div><div class="k-sub">com a estrutura de investidores/banco atual — mês ${Util.monthLabel(cf.start, cf.cfAcumulado.indexOf(Math.min(...cf.cfAcumulado)))}</div></div>
-    <div class="kpi"><div class="k-label">Cash-flow acumulado final</div><div class="k-value ${cf.cfAcumulado[cf.cfAcumulado.length-1]<-1?'neg':'pos'}">${Util.fmtMoney0(cf.cfAcumulado[cf.cfAcumulado.length-1])}</div><div class="k-sub">≈0 se tudo distribuído; negativo indica projeto por financiar</div></div>
-    <div class="kpi"><div class="k-label">Duração modelada</div><div class="k-value">${cf.monthCount} meses</div></div>
+    <div class="kpi"><div class="k-label">Necessidade de capital sem financiamento${kpiInfo('O maior défice de caixa que o projeto teria em qualquer mês, contando só com entradas de vendas (sem investidores nem banco). Fórmula: valor absoluto do mínimo do cash-flow acumulado, calculado antes de aplicar financiamento/investidores.')}</div><div class="k-value neg">${Util.fmtMoney0(cf.capitalNecessario)}</div><div class="k-sub">pior défice antes de investidores/banco — mês ${Util.monthLabel(cf.start,cf.mesPiorCapital)}</div></div>
+    <div class="kpi"><div class="k-label">Pior saldo acumulado${kpiInfo('O ponto mais baixo do cash-flow acumulado real do projeto, já com investidores e financiamento bancário incluídos. Se for negativo, é um défice que fica por cobrir (o projeto já não injeta capital automático para o tapar). Fórmula: mínimo de cf.cfAcumulado.')}</div><div class="k-value ${Math.min(...cf.cfAcumulado)<-1?'neg':'pos'}">${Util.fmtMoney0(Math.min(...cf.cfAcumulado))}</div><div class="k-sub">com a estrutura de investidores/banco atual — mês ${Util.monthLabel(cf.start, cf.cfAcumulado.indexOf(Math.min(...cf.cfAcumulado)))}</div></div>
+    <div class="kpi"><div class="k-label">Cash-flow acumulado final${kpiInfo('O saldo acumulado no último mês do projeto. Perto de zero significa que tudo o que entrou foi distribuído; negativo indica que ficou uma parte do projeto por financiar. Fórmula: cf.cfAcumulado no último mês.')}</div><div class="k-value ${cf.cfAcumulado[cf.cfAcumulado.length-1]<-1?'neg':'pos'}">${Util.fmtMoney0(cf.cfAcumulado[cf.cfAcumulado.length-1])}</div><div class="k-sub">≈0 se tudo distribuído; negativo indica projeto por financiar</div></div>
+    <div class="kpi"><div class="k-label">Duração modelada${kpiInfo('Número de meses simulados no cash-flow, do primeiro ao último mês com algum movimento de entrada ou saída de dinheiro.')}</div><div class="k-value">${cf.monthCount} meses</div></div>
   </div>
   <div class="card"><h3>Cash-flow mensal e acumulado</h3><div class="chart-box"><canvas id="chartCF"></canvas></div></div>
   <div class="tbl-wrap"><table class="data">
@@ -3092,22 +3222,22 @@ function viewPromotor(p, cf){
   return `
   <div class="view-head"><div><h2>Análise do Promotor</h2><p>Dashboard executivo do projeto — cenário <strong>${Store.getScenario()}</strong>.</p></div></div>
   <div class="kpis">
-    <div class="kpi clickable" id="kpiVendas"><div class="k-label">Vendas totais</div><div class="k-value">${Util.fmtMoney0(Util.sum(cf.houseBreakdown,h=>h.precoVenda))}</div></div>
-    <div class="kpi"><div class="k-label">Receitas totais</div><div class="k-value">${Util.fmtMoney0(cf.receitasTotais)}</div></div>
-    <div class="kpi clickable" id="kpiCustos"><div class="k-label">Custos totais (económico)</div><div class="k-value">${Util.fmtMoney0(cf.custosEconomicosTotais)}</div></div>
-    <div class="kpi"><div class="k-label">Resultado antes de impostos</div><div class="k-value">${Util.fmtMoney0(cf.resultadoFinalAntesImpostos)}</div></div>
-    <div class="kpi"><div class="k-label">Tributação estimada</div><div class="k-value">${Util.fmtMoney0(cf.tributacaoTotal)}</div></div>
-    <div class="kpi"><div class="k-label">Resultado líquido estimado</div><div class="k-value ${cf.resultadoLiquido<0?'neg':'pos'}">${Util.fmtMoney0(cf.resultadoLiquido)}</div></div>
-    <div class="kpi"><div class="k-label">Pior saldo acumulado (não financiado)</div><div class="k-value ${Math.min(...cf.cfAcumulado)<-1?'neg':'pos'}">${Util.fmtMoney0(Math.min(...cf.cfAcumulado))}</div><div class="k-sub">défice de caixa que ficaria por cobrir, sem capital do promotor</div></div>
-    <div class="kpi"><div class="k-label">Capital de investidores</div><div class="k-value">${Util.fmtMoney0(cf.totalCapitalInvestidores)}</div></div>
-    <div class="kpi"><div class="k-label">Dívida bancária</div><div class="k-value">${Util.fmtMoney0(cf.totalFinanciamentoBancario)}</div></div>
-    <div class="kpi"><div class="k-label">Distribuição final ao promotor</div><div class="k-value pos">${Util.fmtMoney0(cf.promoterFinalDistribution)}</div><div class="k-sub">capital devolvido + lucro residual</div></div>
-    <div class="kpi"><div class="k-label">ROI</div><div class="k-value">${roi!==null?Util.fmtPct(roi):'—'}</div><div class="k-sub">resultado líquido / custos totais</div></div>
-    <div class="kpi"><div class="k-label">ROE (promotor)</div><div class="k-value">${roe!==null?Util.fmtPct(roe):'—'}</div><div class="k-sub">lucro do promotor / capital próprio investido</div></div>
-    <div class="kpi"><div class="k-label">TIR do promotor (anualizada)</div><div class="k-value">${irr.value!==null?Util.fmtPct(MetricsEngine.annualize(irr.value)):'—'}</div>${irr.warning?`<div class="k-sub" style="color:var(--gold)">${irr.warning}</div>`:''}</div>
-    <div class="kpi"><div class="k-label">VAL (capital próprio do promotor)</div><div class="k-value">${Util.fmtMoney0(val)}</div><div class="k-sub">taxa mensal ${Util.fmtPct(rMensalDesc,3)}</div></div>
-    <div class="kpi"><div class="k-label">Múltiplo sobre capital (MOIC)</div><div class="k-value">${moic!==null?Util.fmtNum(moic,2)+'x':'—'}</div></div>
-    <div class="kpi"><div class="k-label">Duração do projeto</div><div class="k-value">${cf.monthCount} meses</div></div>
+    <div class="kpi clickable" id="kpiVendas"><div class="k-label">Vendas totais${kpiInfo('Soma do preço de venda (efetivo, ou previsto se ainda não vendida) de todas as casas. Fórmula: Σ preço de venda de cada casa.')}</div><div class="k-value">${Util.fmtMoney0(Util.sum(cf.houseBreakdown,h=>h.precoVenda))}</div></div>
+    <div class="kpi"><div class="k-label">Receitas totais${kpiInfo('Total de dinheiro recebido pelo projeto — vendas de casas mais qualquer outra entrada modelada. É a base para calcular o resultado do projeto.')}</div><div class="k-value">${Util.fmtMoney0(cf.receitasTotais)}</div></div>
+    <div class="kpi clickable" id="kpiCustos"><div class="k-label">Custos totais (económico)${kpiInfo('Soma de todos os custos (Custos construção + Custos outros) em base económica, ou seja, excluindo o IVA que é dedutível (que não é um custo real do projeto).')}</div><div class="k-value">${Util.fmtMoney0(cf.custosEconomicosTotais)}</div></div>
+    <div class="kpi"><div class="k-label">Resultado antes de impostos${kpiInfo('Receitas totais menos custos totais (económico), antes de aplicar a taxa de tributação. Fórmula: Receitas totais − Custos totais.')}</div><div class="k-value">${Util.fmtMoney0(cf.resultadoFinalAntesImpostos)}</div></div>
+    <div class="kpi"><div class="k-label">Tributação estimada${kpiInfo('Imposto estimado sobre o resultado antes de impostos, à taxa de tributação definida nos pressupostos do projeto. Fórmula: Resultado antes de impostos × taxa de tributação.')}</div><div class="k-value">${Util.fmtMoney0(cf.tributacaoTotal)}</div></div>
+    <div class="kpi"><div class="k-label">Resultado líquido estimado${kpiInfo('Resultado final do projeto depois de impostos. Fórmula: Resultado antes de impostos − Tributação estimada.')}</div><div class="k-value ${cf.resultadoLiquido<0?'neg':'pos'}">${Util.fmtMoney0(cf.resultadoLiquido)}</div></div>
+    <div class="kpi"><div class="k-label">Pior saldo acumulado (não financiado)${kpiInfo('O ponto mais baixo do cash-flow acumulado do projeto (com investidores/banco atuais). Se negativo, é o défice que ficaria por cobrir, já que não há injeção automática de capital do promotor. Fórmula: mínimo de cf.cfAcumulado.')}</div><div class="k-value ${Math.min(...cf.cfAcumulado)<-1?'neg':'pos'}">${Util.fmtMoney0(Math.min(...cf.cfAcumulado))}</div><div class="k-sub">défice de caixa que ficaria por cobrir, sem capital do promotor</div></div>
+    <div class="kpi"><div class="k-label">Capital de investidores${kpiInfo('Soma de todas as contribuições de capital de investidores externos ao projeto.')}</div><div class="k-value">${Util.fmtMoney0(cf.totalCapitalInvestidores)}</div></div>
+    <div class="kpi"><div class="k-label">Dívida bancária${kpiInfo('Soma dos montantes utilizados em financiamento bancário (empréstimos) associados ao projeto.')}</div><div class="k-value">${Util.fmtMoney0(cf.totalFinanciamentoBancario)}</div></div>
+    <div class="kpi"><div class="k-label">Distribuição final ao promotor${kpiInfo('Valor final entregue ao promotor no fim do projeto: capital próprio devolvido mais o lucro residual, depois de pagos investidores e banco. Fórmula: max(0, saldo acumulado final).')}</div><div class="k-value pos">${Util.fmtMoney0(cf.promoterFinalDistribution)}</div><div class="k-sub">capital devolvido + lucro residual</div></div>
+    <div class="kpi"><div class="k-label">ROI${kpiInfo('Retorno sobre o total investido no projeto (todos os custos, não só o capital do promotor). Fórmula: Resultado líquido ÷ Custos totais.')}</div><div class="k-value">${roi!==null?Util.fmtPct(roi):'—'}</div><div class="k-sub">resultado líquido / custos totais</div></div>
+    <div class="kpi"><div class="k-label">ROE (promotor)${kpiInfo('Retorno sobre o capital próprio efetivamente investido pelo promotor (não sobre o total do projeto). Fórmula: lucro atribuível ao promotor ÷ capital próprio do promotor.')}</div><div class="k-value">${roe!==null?Util.fmtPct(roe):'—'}</div><div class="k-sub">lucro do promotor / capital próprio investido</div></div>
+    <div class="kpi"><div class="k-label">TIR do promotor (anualizada)${kpiInfo('Taxa interna de retorno anualizada, calculada sobre o cash-flow próprio do promotor (entradas e saídas do seu capital, com o timing real de cada mês).')}</div><div class="k-value">${irr.value!==null?Util.fmtPct(MetricsEngine.annualize(irr.value)):'—'}</div>${irr.warning?`<div class="k-sub" style="color:var(--gold)">${irr.warning}</div>`:''}</div>
+    <div class="kpi"><div class="k-label">VAL (capital próprio do promotor)${kpiInfo('Valor atual líquido do cash-flow do promotor, descontado à taxa mensal equivalente à taxa de desconto anual definida nos pressupostos. Positivo indica que o projeto cria valor acima dessa taxa exigida.')}</div><div class="k-value">${Util.fmtMoney0(val)}</div><div class="k-sub">taxa mensal ${Util.fmtPct(rMensalDesc,3)}</div></div>
+    <div class="kpi"><div class="k-label">Múltiplo sobre capital (MOIC)${kpiInfo('Quantas vezes o capital próprio investido pelo promotor é devolvido no total. Fórmula: distribuição final ao promotor ÷ capital próprio investido.')}</div><div class="k-value">${moic!==null?Util.fmtNum(moic,2)+'x':'—'}</div></div>
+    <div class="kpi"><div class="k-label">Duração do projeto${kpiInfo('Número de meses simulados no cash-flow do projeto.')}</div><div class="k-value">${cf.monthCount} meses</div></div>
   </div>
   <div class="grid cols-2">
     <div class="card"><h3>Receitas vs Custos</h3><div class="chart-box"><canvas id="chartRC"></canvas></div></div>
@@ -3163,17 +3293,17 @@ function viewInvestidor(p, cf){
     <select id="investorSelect">${p.investors.map(i=>`<option value="${i.id}" ${i.id===inv.id?'selected':''}>${Util.escapeHtml(i.nome)}</option>`).join('')}</select>
   </div>
   <div class="kpis">
-    <div class="kpi"><div class="k-label">Capital comprometido/investido</div><div class="k-value">${Util.fmtMoney0(contrib.total)}</div></div>
-    <div class="kpi"><div class="k-label">Capital devolvido (previsto)</div><div class="k-value">${Util.fmtMoney0(dist.capitalDevolvido)}</div></div>
-    <div class="kpi"><div class="k-label">Remuneração/participação (prevista)</div><div class="k-value">${Util.fmtMoney0(dist.remuneracao)}</div></div>
-    <div class="kpi"><div class="k-label">Total previsto a receber</div><div class="k-value pos">${Util.fmtMoney0(totalRecebido)}</div></div>
-    <div class="kpi"><div class="k-label">Lucro</div><div class="k-value ${lucro<0?'neg':'pos'}">${Util.fmtMoney0(lucro)}</div></div>
-    <div class="kpi"><div class="k-label">Rentabilidade total</div><div class="k-value">${contrib.total>0?Util.fmtPct(lucro/contrib.total):'—'}</div></div>
-    <div class="kpi"><div class="k-label">Rentabilidade anualizada</div><div class="k-value">${rentAnualizada!==null?Util.fmtPct(rentAnualizada):'—'}</div></div>
-    <div class="kpi"><div class="k-label">MOIC</div><div class="k-value">${contrib.total>0?Util.fmtNum(totalRecebido/contrib.total,2)+'x':'—'}</div></div>
-    <div class="kpi"><div class="k-label">TIR anualizada</div><div class="k-value">${irr.value!==null?Util.fmtPct(MetricsEngine.annualize(irr.value)):'—'}</div></div>
-    <div class="kpi"><div class="k-label">VAL do investimento</div><div class="k-value">${Util.fmtMoney0(val)}</div></div>
-    <div class="kpi"><div class="k-label">Data prevista de saída</div><div class="k-value" style="font-size:16px;">${Util.fmtDate(inv.dataSaidaPrevista)}</div></div>
+    <div class="kpi"><div class="k-label">Capital comprometido/investido${kpiInfo('Soma de todas as entradas de capital deste investidor no projeto (as suas contribuições registadas).')}</div><div class="k-value">${Util.fmtMoney0(contrib.total)}</div></div>
+    <div class="kpi"><div class="k-label">Capital devolvido (previsto)${kpiInfo('Parte do total a receber que corresponde à devolução do capital originalmente investido (sem a remuneração/lucro).')}</div><div class="k-value">${Util.fmtMoney0(dist.capitalDevolvido)}</div></div>
+    <div class="kpi"><div class="k-label">Remuneração/participação (prevista)${kpiInfo('Retorno/remuneração previsto para este investidor, calculado de acordo com o modelo de retorno definido (fixo, percentagem anual, participação no lucro, etc.).')}</div><div class="k-value">${Util.fmtMoney0(dist.remuneracao)}</div></div>
+    <div class="kpi"><div class="k-label">Total previsto a receber${kpiInfo('Soma do capital devolvido com a remuneração/participação prevista. Fórmula: Capital devolvido + Remuneração.')}</div><div class="k-value pos">${Util.fmtMoney0(totalRecebido)}</div></div>
+    <div class="kpi"><div class="k-label">Lucro${kpiInfo('Ganho líquido do investidor. Fórmula: Total previsto a receber − Capital investido.')}</div><div class="k-value ${lucro<0?'neg':'pos'}">${Util.fmtMoney0(lucro)}</div></div>
+    <div class="kpi"><div class="k-label">Rentabilidade total${kpiInfo('Lucro em percentagem do capital investido, sem considerar o tempo de permanência do investimento. Fórmula: Lucro ÷ Capital investido.')}</div><div class="k-value">${contrib.total>0?Util.fmtPct(lucro/contrib.total):'—'}</div></div>
+    <div class="kpi"><div class="k-label">Rentabilidade anualizada${kpiInfo('Rentabilidade total normalizada para uma base anual, tendo em conta o número de anos entre a entrada e a saída prevista. Fórmula: (Total a receber ÷ Capital investido)^(1/anos) − 1.')}</div><div class="k-value">${rentAnualizada!==null?Util.fmtPct(rentAnualizada):'—'}</div></div>
+    <div class="kpi"><div class="k-label">MOIC${kpiInfo('Múltiplo sobre o capital investido — quantas vezes o investidor recebe de volta o que investiu. Fórmula: Total previsto a receber ÷ Capital investido.')}</div><div class="k-value">${contrib.total>0?Util.fmtNum(totalRecebido/contrib.total,2)+'x':'—'}</div></div>
+    <div class="kpi"><div class="k-label">TIR anualizada${kpiInfo('Taxa interna de retorno anualizada, calculada sobre o cash-flow próprio deste investidor (entradas negativas nas contribuições, entrada positiva na saída), com o timing real de cada mês.')}</div><div class="k-value">${irr.value!==null?Util.fmtPct(MetricsEngine.annualize(irr.value)):'—'}</div></div>
+    <div class="kpi"><div class="k-label">VAL do investimento${kpiInfo('Valor atual líquido do cash-flow deste investidor, descontado à taxa mensal equivalente à taxa de desconto anual dos pressupostos do projeto.')}</div><div class="k-value">${Util.fmtMoney0(val)}</div></div>
+    <div class="kpi"><div class="k-label">Data prevista de saída${kpiInfo('Data em que este investidor deverá receber o capital devolvido e a remuneração, definida na ficha do investidor.')}</div><div class="k-value" style="font-size:16px;">${Util.fmtDate(inv.dataSaidaPrevista)}</div></div>
   </div>
   <div class="card"><h3>Evolução: investimento → recebimentos → saída</h3><div class="chart-box"><canvas id="chartInvestor"></canvas></div></div>
   <div class="methodology">Rentabilidade total ≠ rentabilidade anualizada: a primeira mede o ganho sobre todo o período; a segunda normaliza para uma base anual usando o número de anos de permanência do capital.</div>`;
@@ -3316,6 +3446,7 @@ function chartColors(){
 
 function wireView(view, p, cf){
   destroyCharts();
+  wireSortableHeaders();
   const C = chartColors();
   if(view==='contas'){
     document.getElementById('btnAddEmail').onclick = async ()=>{
@@ -3379,6 +3510,20 @@ function wireView(view, p, cf){
         Store.update(pr=>{ const c = Util.deepClone(pr.construcaoCustos.find(c=>c.id===id)); c.id=Util.uid(); c.descricao+=' (cópia)'; pr.construcaoCustos.push(c); });
         toast('Custo de construção duplicado.');
       };
+      const moveBtn = tr.querySelector('[data-act="move"]');
+      if(moveBtn) moveBtn.onclick = ()=>{
+        if(!confirm('Mover este custo para "Custos outros"? O valor de venda mantém-se; o valor de compra fica a 0.')) return;
+        Store.update(pr=>{
+          const i = pr.construcaoCustos.findIndex(c=>c.id===id);
+          if(i<0) return;
+          const item = pr.construcaoCustos.splice(i,1)[0];
+          delete item.valorConstrucao;
+          item.valorCompra = 0;
+          if(!pr.custosOutros) pr.custosOutros=[];
+          pr.custosOutros.push(item);
+        });
+        toast('Custo movido para "Custos outros".');
+      };
       tr.querySelector('[data-act="del"]').onclick = ()=>{
         if(confirm('Eliminar este custo de construção?')) Store.update(pr=>{ pr.construcaoCustos = pr.construcaoCustos.filter(c=>c.id!==id); });
       };
@@ -3407,6 +3552,20 @@ function wireView(view, p, cf){
       tr.querySelector('[data-act="dup"]').onclick = ()=>{
         Store.update(pr=>{ const c = Util.deepClone(pr.custosOutros.find(c=>c.id===id)); c.id=Util.uid(); c.descricao+=' (cópia)'; pr.custosOutros.push(c); });
         toast('Custo duplicado.');
+      };
+      const moveBtn = tr.querySelector('[data-act="move"]');
+      if(moveBtn) moveBtn.onclick = ()=>{
+        if(!confirm('Mover este custo para "Custos construção"? O valor de venda mantém-se; o valor de construção fica a 0.')) return;
+        Store.update(pr=>{
+          const i = pr.custosOutros.findIndex(c=>c.id===id);
+          if(i<0) return;
+          const item = pr.custosOutros.splice(i,1)[0];
+          delete item.valorCompra;
+          item.valorConstrucao = 0;
+          if(!pr.construcaoCustos) pr.construcaoCustos=[];
+          pr.construcaoCustos.push(item);
+        });
+        toast('Custo movido para "Custos construção".');
       };
       tr.querySelector('[data-act="del"]').onclick = ()=>{
         if(confirm('Eliminar este custo?')) Store.update(pr=>{ pr.custosOutros = pr.custosOutros.filter(c=>c.id!==id); });
