@@ -589,7 +589,7 @@ const Store = (function(){
         activeId = parsed.activeId||null;
       }
     }catch(e){ console.warn('Falha ao ler localStorage', e); }
-    Object.values(projects).forEach(pr=>{ try{ StorageEngine.migrate(pr); }catch(e){} });
+    Object.values(projects).forEach(pr=>{ try{ StorageEngine.migrate(pr); }catch(e){ console.error('Falha na migração (load local)', e); } });
     if(Object.keys(projects).length===0){
       const demo = buildDemoProject();
       projects[demo.id] = demo;
@@ -683,7 +683,7 @@ const LiveSync = (function(){
       const remote = await RemoteStore.pullAll();
       if(remote){
         const projects = {};
-        remote.forEach(r=>{ try{ projects[r.id] = StorageEngine.migrate(r.data); }catch(e){ projects[r.id] = r.data; } });
+        remote.forEach(r=>{ try{ projects[r.id] = StorageEngine.migrate(r.data); }catch(e){ console.error('Falha na migração (refreshAccessAndProjects)', e, r); projects[r.id] = r.data; } });
         Store.replaceAll(projects, Auth.isAdmin());
       }
       render();
@@ -704,7 +704,7 @@ const LiveSync = (function(){
         const row = payload.new;
         if(!row) return;
         let data;
-        try{ data = StorageEngine.migrate(row.data); }catch(e){ data = row.data; }
+        try{ data = StorageEngine.migrate(row.data); }catch(e){ console.error('Falha na migração (LiveSync upsert)', e, row); data = row.data; }
         const isNew = !Store.hasProject(row.id);
         Store.applyRemoteUpsert(row.id, data);
         // Um projeto novo pode significar acesso novo (RLS já filtrou) — confirma via lista de acesso também.
@@ -1724,26 +1724,37 @@ const StorageEngine = (function(){
     if(!project.waterfall) project.waterfall = { ativo:false, ordem:['suprimentos','preferencial','capital','lucro','residual'] };
     if(!project.construcaoCustos) project.construcaoCustos = [];
     if(!project.custosOutros) project.custosOutros = [];
-    // Migração única: os custos que estavam na aba "Custos" passam a viver em
+    // Migração: os custos que estavam na aba "Custos" passam a viver em
     // "Custos construção" (categorias de obra) ou "Custos outros" (as restantes),
     // que passam a ser a fonte real dos custos do projeto. A aba "Custos" passa a
     // ser apenas uma lista consolidada das outras duas.
-    if(!project.custosMigradosParaSubabas){
-      const categoriasConstrucao = ['Construção','Infraestruturas','Fiscalização'];
-      (project.costs||[]).forEach(c=>{
-        const item = {
-          id: c.id, categoria: c.categoria, subcategoria: c.subcategoria||'', descricao: c.descricao||'', fornecedor: c.fornecedor||'',
-          valorVenda: c.valorBase||0,
-          temIVA: !!c.temIVA, taxaIVA: c.taxaIVA||0, ivaDedutivel: c.ivaDedutivel||'nao', percDedutivel: c.percDedutivel||0,
-          mesInicio: c.mesInicio||0, mesFim: (c.mesFim===undefined||c.mesFim===null)?(c.mesInicio||0):c.mesFim,
-          distribuicao: c.distribuicao||'unico',
-          manualValores: Util.deepClone(c.manualValores||[]), percentuais: Util.deepClone(c.percentuais||[]),
-          observacoes: c.observacoes||''
-        };
-        if(categoriasConstrucao.includes(c.categoria)){ item.valorConstrucao = 0; project.construcaoCustos.push(item); }
-        else { item.valorCompra = 0; project.custosOutros.push(item); }
-      });
-      project.costs = [];
+    // Nota: em vez de depender só de uma flag "já migrado" (que, se ficasse
+    // marcada por engano sem o conteúdo ter chegado a ser gravado no servidor,
+    // bloquearia a migração para sempre), corre sempre que ainda existirem
+    // itens em "project.costs" — é o próprio conteúdo por migrar que decide,
+    // não apenas a flag. Isto torna a migração auto-reparável.
+    if((project.costs||[]).length > 0){
+      try{
+        const categoriasConstrucao = ['Construção','Infraestruturas','Fiscalização'];
+        project.costs.forEach(c=>{
+          const item = {
+            id: c.id, categoria: c.categoria, subcategoria: c.subcategoria||'', descricao: c.descricao||'', fornecedor: c.fornecedor||'',
+            valorVenda: c.valorBase||0,
+            temIVA: !!c.temIVA, taxaIVA: c.taxaIVA||0, ivaDedutivel: c.ivaDedutivel||'nao', percDedutivel: c.percDedutivel||0,
+            mesInicio: c.mesInicio||0, mesFim: (c.mesFim===undefined||c.mesFim===null)?(c.mesInicio||0):c.mesFim,
+            distribuicao: c.distribuicao||'unico',
+            manualValores: Util.deepClone(c.manualValores||[]), percentuais: Util.deepClone(c.percentuais||[]),
+            observacoes: c.observacoes||''
+          };
+          if(categoriasConstrucao.includes(c.categoria)){ item.valorConstrucao = 0; project.construcaoCustos.push(item); }
+          else { item.valorCompra = 0; project.custosOutros.push(item); }
+        });
+        project.costs = [];
+        project.custosMigradosParaSubabas = true;
+      }catch(e){
+        console.error('Falha ao migrar custos para Custos construção/Custos outros', e, project);
+      }
+    } else if(!project.custosMigradosParaSubabas){
       project.custosMigradosParaSubabas = true;
     }
     (project.investors||[]).forEach(inv=>{
@@ -3704,10 +3715,10 @@ Auth.init(async ()=>{
     let migrouAlgum = false;
     remote.forEach(r=>{
       try{
-        const before = JSON.stringify((r.data&&r.data.costs)||[]);
+        const before = (r.data&&r.data.costs&&r.data.costs.length)||0;
         projects[r.id] = StorageEngine.migrate(r.data);
-        if(before!=='[]' && JSON.stringify(projects[r.id].costs||[])==='[]') migrouAlgum = true;
-      }catch(e){ projects[r.id] = r.data; }
+        if(before>0 && (projects[r.id].costs||[]).length===0) migrouAlgum = true;
+      }catch(e){ console.error('Falha na migração (arranque)', e, r); projects[r.id] = r.data; }
     });
     Store.replaceAll(projects, isAdmin);
     // Garante que a migração de "Custos" para as novas abas fica gravada no servidor
