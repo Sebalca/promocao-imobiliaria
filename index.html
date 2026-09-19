@@ -112,6 +112,8 @@ table.data th.sortable{cursor:pointer;user-select:none;white-space:nowrap;}
 table.data th.sortable:hover{color:var(--ink);}
 table.data th.sortable .sort-arrow{font-size:10px;color:var(--accent-ink);margin-left:2px;}
 .mes-hint{font-size:11px;color:var(--ink-faint);margin-top:3px;}
+table.data tr.cf-mes-fim{background:var(--accent-soft-bg,rgba(90,120,255,0.08));}
+table.data tr.cf-mes-fim td{border-bottom:2px solid var(--accent-soft-border,var(--border));}
 
 table{width:100%;border-collapse:collapse;font-size:12.5px;}
 table.data th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.03em;color:var(--ink-soft);padding:7px 8px;border-bottom:1px solid var(--border-strong);white-space:nowrap;}
@@ -1193,12 +1195,14 @@ const CashFlowEngine = (function(){
       capitalSocial: zeros(), suprimentos: zeros(), prestacoes: zeros(), creditoBancario: zeros(),
       cpcv: zeros(), pagamentosIntermedios: zeros(), escrituras: zeros(), outrosProveitos: zeros(),
       custosPorCategoria: {}, // categoria -> array cashOut
+      custosPorCategoriaSub: {}, // "categoria|||subcategoria" -> {categoria,subcategoria,arr}
       custosEconomicoPorCategoria: {},
       ivaSuportado: zeros(), ivaDedutivel: zeros(), ivaNaoDedutivel: zeros(),
       jurosFinanciamento: zeros(), comissoesFinanciamento: zeros(), amortizacaoDivida: zeros(), saldoDivida: zeros(),
       devolucaoCapitalSocial: zeros(), devolucaoSuprimentos: zeros(), devolucaoPrestacoes: zeros(),
       remuneracaoInvestidores: zeros(), participacaoLucroInvestidores: zeros(),
       tributacao: zeros(),
+      investorEventos: [], // {mes, tipo, valor, invNome} — devoluções/remuneração/participação, com identidade do investidor
     };
     const costBreakdown = []; // {id, categoria, descricao, cashOut, economico, ivaSuportado, ivaDedutivel}
 
@@ -1208,9 +1212,12 @@ const CashFlowEngine = (function(){
       const dist = CostEngine.distributeCost(cost, start, monthCount);
       if(!led.custosPorCategoria[cost.categoria]) led.custosPorCategoria[cost.categoria]=zeros();
       if(!led.custosEconomicoPorCategoria[cost.categoria]) led.custosEconomicoPorCategoria[cost.categoria]=zeros();
+      const subKey = cost.categoria+'|||'+(cost.subcategoria||'');
+      if(!led.custosPorCategoriaSub[subKey]) led.custosPorCategoriaSub[subKey] = {categoria:cost.categoria, subcategoria:cost.subcategoria||'', arr:zeros()};
       let totCashOut=0, totEcon=0, totIvaS=0, totIvaD=0;
       dist.forEach((slice,m)=>{
         led.custosPorCategoria[cost.categoria][m]+= slice.cashOut;
+        led.custosPorCategoriaSub[subKey].arr[m]+= slice.cashOut;
         led.custosEconomicoPorCategoria[cost.categoria][m]+= slice.economico;
         led.ivaSuportado[m]+= slice.ivaSuportado;
         led.ivaDedutivel[m]+= slice.ivaDedutivel;
@@ -1293,6 +1300,7 @@ const CashFlowEngine = (function(){
           else if(ev.tipo==='devolucao_prestacoes'){ led.devolucaoPrestacoes[m]+=ev.valor; totCapital+=ev.valor; }
           else if(ev.tipo==='remuneracao'){ led.remuneracaoInvestidores[m]+=ev.valor; totRemun+=ev.valor; }
           else if(ev.tipo==='participacao_lucro'){ led.participacaoLucroInvestidores[m]+=ev.valor; totPart+=ev.valor; }
+          if(Math.abs(ev.valor)>0.005) led.investorEventos.push({mes:m, tipo:ev.tipo, valor:ev.valor, invNome:inv.nome});
         });
         investorDistBreakdown.push({id:inv.id, nome:inv.nome, capitalDevolvido:totCapital, remuneracao:totRemun+totPart});
       });
@@ -1370,6 +1378,10 @@ const CashFlowEngine = (function(){
         led.devolucaoCapitalSocial[settlementIdx] += a.capital;
         led.remuneracaoInvestidores[settlementIdx] += a.preferencial;
         led.participacaoLucroInvestidores[settlementIdx] += a.lucro;
+        if(Math.abs(a.suprimentos)>0.005) led.investorEventos.push({mes:settlementIdx, tipo:'devolucao_suprimentos', valor:a.suprimentos, invNome:inv.nome});
+        if(Math.abs(a.capital)>0.005) led.investorEventos.push({mes:settlementIdx, tipo:'devolucao_capital_social', valor:a.capital, invNome:inv.nome});
+        if(Math.abs(a.preferencial)>0.005) led.investorEventos.push({mes:settlementIdx, tipo:'remuneracao', valor:a.preferencial, invNome:inv.nome});
+        if(Math.abs(a.lucro)>0.005) led.investorEventos.push({mes:settlementIdx, tipo:'participacao_lucro', valor:a.lucro, invNome:inv.nome});
         investorDistBreakdown.push({id:inv.id, nome:inv.nome, capitalDevolvido:a.suprimentos+a.capital, remuneracao:a.preferencial+a.lucro});
       });
       promoterFinalDistribution = wf.promoterResidual;
@@ -2920,10 +2932,19 @@ function phasesManagerModal(project, onSave){
    VIEW: INVESTIDORES
    ========================================================================= */
 function viewInvestidores(p, cf){
-  const rows = p.investors.map(inv=>{
+  const itemsOriginal = p.investors.map(inv=>{
     const contrib = cf.investorContribBreakdown.find(x=>x.id===inv.id)||{total:0};
     const dist = cf.investorDistBreakdown.find(x=>x.id===inv.id)||{capitalDevolvido:0,remuneracao:0};
     const dataNec = computeDataNecessidade(p, inv);
+    return {inv, contrib, dist, dataNec};
+  });
+  const items = applyTableSort('investidores', itemsOriginal, {
+    nome: x=>x.inv.nome||'', referencia: x=>x.inv.referencia||'', capital: x=>x.contrib.total||0,
+    modelo: x=>(x.inv.returnModel?x.inv.returnModel.tipo:'')||'', entrada: x=>x.inv.dataEntrada||'',
+    saida: x=>x.inv.dataSaidaPrevista||'', dataNec: x=>x.dataNec||'',
+    totalReceber: x=>(x.dist.capitalDevolvido+x.dist.remuneracao)||0
+  });
+  const rows = items.map(({inv, contrib, dist, dataNec})=>{
     return `<tr data-id="${inv.id}">
       <td>${Util.escapeHtml(inv.nome)}</td>
       <td>${Util.escapeHtml(inv.referencia||'')}</td>
@@ -2944,7 +2965,17 @@ function viewInvestidores(p, cf){
     <button class="tb-btn primary" id="btnAddInvestor">+ Adicionar investidor</button>
   </div>
   <div class="tbl-wrap"><table class="data">
-    <thead><tr><th>Nome</th><th>Referência</th><th class="num">Capital investido</th><th>Modelo</th><th>Entrada</th><th>Saída prevista</th><th>Data necessidade</th><th class="num">Total previsto a receber</th><th></th></tr></thead>
+    <thead><tr>
+      ${sortTh('investidores','nome','Nome')}
+      ${sortTh('investidores','referencia','Referência')}
+      ${sortTh('investidores','capital','Capital investido','num')}
+      ${sortTh('investidores','modelo','Modelo')}
+      ${sortTh('investidores','entrada','Entrada')}
+      ${sortTh('investidores','saida','Saída prevista')}
+      ${sortTh('investidores','dataNec','Data necessidade')}
+      ${sortTh('investidores','totalReceber','Total previsto a receber','num')}
+      <th></th>
+    </tr></thead>
     <tbody>${rows||'<tr><td colspan="9" class="empty">Sem investidores registados.</td></tr>'}</tbody>
   </table></div>
   <div class="card"><h3>Waterfall de distribuição</h3>
@@ -3186,6 +3217,15 @@ const CF_SAIDA_LABELS = {
 // tem granularidade mensal e por isso "arredondava" sempre ao dia 1 do mês).
 const GRANULAR_ENTRADA_KEYS = ['capitalSocial','suprimentos','prestacoes','cpcv','pagamentosIntermedios','escrituras'];
 const TIPO_CONTRIB_LABELS = {capital_social:'Capital social', suprimentos:'Suprimentos', prestacoes:'Prestações acessórias'};
+// Saídas para investidores (devoluções/remuneração/participação) são discriminadas por
+// investidor via cf.led.investorEventos, em vez de agregadas por categoria — por isso ficam
+// de fora da agregação genérica por categoria (tal como GRANULAR_ENTRADA_KEYS para entradas).
+const GRANULAR_SAIDA_KEYS = ['devolucaoCapitalSocial','devolucaoSuprimentos','devolucaoPrestacoes','remuneracaoInvestidores','participacaoLucroInvestidores'];
+const INVESTOR_EVENT_LABELS = {
+  devolucao_capital_social:'Devolução de capital social', devolucao_suprimentos:'Devolução de suprimentos',
+  devolucao_prestacoes:'Devolução de prestações acessórias', remuneracao:'Remuneração de investidores',
+  participacao_lucro:'Participação nos lucros (investidores)'
+};
 function buildGranularEntradas(p){
   const out = [];
   (p.investors||[]).forEach(inv=>{
@@ -3223,14 +3263,26 @@ function cfMonthMovements(p, cf, i){
     const arr = cf.led[k];
     return {label:CF_ENTRADA_LABELS[k], v:(arr&&arr[i])||0, tipo:'entrada'};
   }).filter(x=>Math.abs(x.v)>0.005);
-  const custosDetail = Object.keys(cf.led.custosPorCategoria).map(k=>({
-    label:'Custo — '+k, v:(cf.led.custosPorCategoria[k]&&cf.led.custosPorCategoria[k][i])||0, tipo:'saida'
+  const custosDetail = Object.values(cf.led.custosPorCategoriaSub||{}).map(x=>({
+    label:'Custo — '+x.categoria+(x.subcategoria?' / '+x.subcategoria:''), v:(x.arr&&x.arr[i])||0, tipo:'saida'
   })).filter(x=>Math.abs(x.v)>0.005);
-  const outrasSaidas = Object.keys(CF_SAIDA_LABELS).map(k=>{
+  const saiInvestidores = (cf.led.investorEventos||[]).filter(x=>x.mes===i).map(x=>({
+    label:`${INVESTOR_EVENT_LABELS[x.tipo]||x.tipo} - ${x.invNome}`, v:x.valor, tipo:'saida'
+  })).filter(x=>Math.abs(x.v)>0.005);
+  const outrasSaidas = Object.keys(CF_SAIDA_LABELS).filter(k=>!GRANULAR_SAIDA_KEYS.includes(k)).map(k=>{
     const arr = k==='distribuicaoPromotor' ? cf.led.distribuicaoPromotor : cf.led[k];
     return {label:CF_SAIDA_LABELS[k], v:(arr&&arr[i])||0, tipo:'saida'};
   }).filter(x=>Math.abs(x.v)>0.005);
-  return [...entGranular, ...entAgregado, ...custosDetail, ...outrasSaidas];
+  return [...entGranular, ...entAgregado, ...custosDetail, ...saiInvestidores, ...outrasSaidas];
+}
+// Bloco de KPIs partilhado entre a vista "Cash-Flow" (geral) e "Flow necessidades".
+function kpisCashflowBlock(cf){
+  return `<div class="kpis">
+    <div class="kpi"><div class="k-label">Necessidade de capital sem financiamento${kpiInfo('O maior défice de caixa que o projeto teria em qualquer mês, contando só com entradas de vendas (sem investidores nem banco). Fórmula: valor absoluto do mínimo do cash-flow acumulado, calculado antes de aplicar financiamento/investidores.')}</div><div class="k-value neg">${Util.fmtMoney0(cf.capitalNecessario)}</div><div class="k-sub">pior défice antes de investidores/banco — mês ${Util.monthLabel(cf.start,cf.mesPiorCapital)}</div></div>
+    <div class="kpi"><div class="k-label">Pior saldo acumulado${kpiInfo('O ponto mais baixo do cash-flow acumulado real do projeto, já com investidores e financiamento bancário incluídos. Se for negativo, é um défice que fica por cobrir (o projeto já não injeta capital automático para o tapar). Fórmula: mínimo de cf.cfAcumulado.')}</div><div class="k-value ${Math.min(...cf.cfAcumulado)<-1?'neg':'pos'}">${Util.fmtMoney0(Math.min(...cf.cfAcumulado))}</div><div class="k-sub">com a estrutura de investidores/banco atual — mês ${Util.monthLabel(cf.start, cf.cfAcumulado.indexOf(Math.min(...cf.cfAcumulado)))}</div></div>
+    <div class="kpi"><div class="k-label">Cash-flow acumulado final${kpiInfo('O saldo acumulado no último mês do projeto. Perto de zero significa que tudo o que entrou foi distribuído; negativo indica que ficou uma parte do projeto por financiar. Fórmula: cf.cfAcumulado no último mês.')}</div><div class="k-value ${cf.cfAcumulado[cf.cfAcumulado.length-1]<-1?'neg':'pos'}">${Util.fmtMoney0(cf.cfAcumulado[cf.cfAcumulado.length-1])}</div><div class="k-sub">≈0 se tudo distribuído; negativo indica projeto por financiar</div></div>
+    <div class="kpi"><div class="k-label">Duração modelada${kpiInfo('Número de meses simulados no cash-flow, do primeiro ao último mês com algum movimento de entrada ou saída de dinheiro.')}</div><div class="k-value">${cf.monthCount} meses</div></div>
+  </div>`;
 }
 function cashflowSubTabs(){
   const sv = UI.cashflowSubView||'geral';
@@ -3269,12 +3321,7 @@ function viewCashflow(p, cf){
   return `
   <div class="view-head"><div><h2>Cash-Flow Mensal</h2><p>Linha temporal completa do projeto, do primeiro ao último mês com movimento, apenas com o que foi introduzido (custos, vendas, financiamento, investidores) — o saldo pode ficar negativo se o projeto estiver, nesse momento, por financiar. No final, se sobrar saldo positivo, é distribuído ao promotor. Clica numa linha da tabela para ver o detalhe do mês. Cenário: <strong>${Store.getScenario()}</strong>. Cálculo pelo ${UI.custoBasis==='custo'?'valor de custo (construção/compra)':'valor de venda'} das rubricas de custos.</p></div></div>
   ${cashflowSubTabs()}
-  <div class="kpis">
-    <div class="kpi"><div class="k-label">Necessidade de capital sem financiamento${kpiInfo('O maior défice de caixa que o projeto teria em qualquer mês, contando só com entradas de vendas (sem investidores nem banco). Fórmula: valor absoluto do mínimo do cash-flow acumulado, calculado antes de aplicar financiamento/investidores.')}</div><div class="k-value neg">${Util.fmtMoney0(cf.capitalNecessario)}</div><div class="k-sub">pior défice antes de investidores/banco — mês ${Util.monthLabel(cf.start,cf.mesPiorCapital)}</div></div>
-    <div class="kpi"><div class="k-label">Pior saldo acumulado${kpiInfo('O ponto mais baixo do cash-flow acumulado real do projeto, já com investidores e financiamento bancário incluídos. Se for negativo, é um défice que fica por cobrir (o projeto já não injeta capital automático para o tapar). Fórmula: mínimo de cf.cfAcumulado.')}</div><div class="k-value ${Math.min(...cf.cfAcumulado)<-1?'neg':'pos'}">${Util.fmtMoney0(Math.min(...cf.cfAcumulado))}</div><div class="k-sub">com a estrutura de investidores/banco atual — mês ${Util.monthLabel(cf.start, cf.cfAcumulado.indexOf(Math.min(...cf.cfAcumulado)))}</div></div>
-    <div class="kpi"><div class="k-label">Cash-flow acumulado final${kpiInfo('O saldo acumulado no último mês do projeto. Perto de zero significa que tudo o que entrou foi distribuído; negativo indica que ficou uma parte do projeto por financiar. Fórmula: cf.cfAcumulado no último mês.')}</div><div class="k-value ${cf.cfAcumulado[cf.cfAcumulado.length-1]<-1?'neg':'pos'}">${Util.fmtMoney0(cf.cfAcumulado[cf.cfAcumulado.length-1])}</div><div class="k-sub">≈0 se tudo distribuído; negativo indica projeto por financiar</div></div>
-    <div class="kpi"><div class="k-label">Duração modelada${kpiInfo('Número de meses simulados no cash-flow, do primeiro ao último mês com algum movimento de entrada ou saída de dinheiro.')}</div><div class="k-value">${cf.monthCount} meses</div></div>
-  </div>
+  ${kpisCashflowBlock(cf)}
   <div class="card"><h3>Cash-flow mensal e acumulado</h3><div class="chart-box"><canvas id="chartCF"></canvas></div></div>
   <div class="tbl-wrap"><table class="data">
     <thead><tr><th>Mês</th><th class="num">Entradas</th><th class="num">Saídas</th><th class="num">CF líquido</th><th class="num">CF acumulado</th></tr></thead>
@@ -3288,29 +3335,37 @@ function viewCashflowNecessidades(p, cf){
   const linhas = [];
   // Entradas discriminadas por investidor/fase, com a data exata de cada movimento.
   buildGranularEntradas(p).forEach(x=> linhas.push(x));
-  // Restantes entradas (crédito bancário, outros proveitos) e todas as saídas, por mês
-  // (sem discriminação individual — a fonte destes valores só tem granularidade mensal).
+  // Restantes entradas (crédito bancário, outros proveitos), saídas para investidores
+  // (discriminadas por investidor) e custos (discriminados por categoria/subcategoria) e
+  // demais saídas, por mês (sem granularidade diária — a fonte destes valores só tem
+  // granularidade mensal).
   for(let i=0;i<cf.monthCount;i++){
     const dt = Util.addMonths(cf.start, i);
     Object.keys(CF_ENTRADA_LABELS).filter(k=>!GRANULAR_ENTRADA_KEYS.includes(k)).forEach(k=>{
       const v = (cf.led[k]&&cf.led[k][i])||0;
       if(Math.abs(v)>0.005) linhas.push({data:dt, tipo:'entrada', v, label:CF_ENTRADA_LABELS[k]});
     });
-    Object.keys(cf.led.custosPorCategoria).forEach(k=>{
-      const v = (cf.led.custosPorCategoria[k]&&cf.led.custosPorCategoria[k][i])||0;
-      if(Math.abs(v)>0.005) linhas.push({data:dt, tipo:'saida', v, label:'Custo — '+k});
+    Object.values(cf.led.custosPorCategoriaSub||{}).forEach(x=>{
+      const v = (x.arr&&x.arr[i])||0;
+      if(Math.abs(v)>0.005) linhas.push({data:dt, tipo:'saida', v, label:'Custo — '+x.categoria+(x.subcategoria?' / '+x.subcategoria:'')});
     });
-    Object.keys(CF_SAIDA_LABELS).forEach(k=>{
+    (cf.led.investorEventos||[]).filter(x=>x.mes===i).forEach(x=>{
+      if(Math.abs(x.valor)>0.005) linhas.push({data:dt, tipo:'saida', v:x.valor, label:`${INVESTOR_EVENT_LABELS[x.tipo]||x.tipo} - ${x.invNome}`});
+    });
+    Object.keys(CF_SAIDA_LABELS).filter(k=>!GRANULAR_SAIDA_KEYS.includes(k)).forEach(k=>{
       const arr = k==='distribuicaoPromotor' ? cf.led.distribuicaoPromotor : cf.led[k];
       const v = (arr&&arr[i])||0;
       if(Math.abs(v)>0.005) linhas.push({data:dt, tipo:'saida', v, label:CF_SAIDA_LABELS[k]});
     });
   }
   linhas.sort((a,b)=> a.data<b.data?-1:(a.data>b.data?1:0));
+  // marca a última linha de cada mês (para destacar visualmente a fronteira entre meses)
+  const mesKey = iso => (iso||'').slice(0,7);
+  linhas.forEach((r,idx)=>{ r.fimDoMes = (idx===linhas.length-1) || (mesKey(linhas[idx+1].data) !== mesKey(r.data)); });
   let saldo = 0;
   const rowsHtml = linhas.map(r=>{
     saldo += (r.tipo==='entrada' ? r.v : -r.v);
-    return `<tr>
+    return `<tr class="${r.fimDoMes?'cf-mes-fim':''}">
       <td class="mono">${Util.fmtDate(r.data)}</td>
       <td class="num mono" style="color:var(--neg)">${r.tipo==='saida'?Util.fmtMoney0(r.v):''}</td>
       <td class="num mono" style="color:var(--accent-ink)">${r.tipo==='entrada'?Util.fmtMoney0(r.v):''}</td>
@@ -3319,8 +3374,9 @@ function viewCashflowNecessidades(p, cf){
     </tr>`;
   }).join('');
   return `
-  <div class="view-head"><div><h2>Flow necessidades</h2><p>Todos os movimentos de dinheiro do projeto, um por linha, por ordem cronológica — como uma folha de caixa. Saldo acumulado linha a linha. Cálculo pelo ${UI.custoBasis==='custo'?'valor de custo (construção/compra)':'valor de venda'} das rubricas de custos.</p></div></div>
+  <div class="view-head"><div><h2>Flow necessidades</h2><p>Todos os movimentos de dinheiro do projeto, um por linha, por ordem cronológica — como uma folha de caixa. Saldo acumulado linha a linha. A última linha de cada mês fica destacada para marcar a fronteira entre meses. Cálculo pelo ${UI.custoBasis==='custo'?'valor de custo (construção/compra)':'valor de venda'} das rubricas de custos.</p></div></div>
   ${cashflowSubTabs()}
+  ${kpisCashflowBlock(cf)}
   <div class="card"><h3>Cash-flow mensal e acumulado</h3><div class="chart-box"><canvas id="chartCFNecessidades"></canvas></div></div>
   <div class="tbl-wrap"><table class="data">
     <thead><tr><th>Data</th><th class="num">Saída</th><th class="num">Entrada</th><th>Categoria / Observações</th><th class="num">Saldo</th></tr></thead>
