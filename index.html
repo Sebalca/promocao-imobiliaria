@@ -281,6 +281,7 @@ function newProject(nome){
     meta: { nome: nome||'Novo Projeto', localizacao:'', promotor:'', descricao:'', dataInicioPrevista: today, dataFimPrevista: Util.addMonths(today,24), numMoradias:0, observacoes:'' },
     assumptions: { dataInicio: today, dataFim: Util.addMonths(today,24), taxaDescontoAnual: 0.10, taxaTributacao: 0.21, ivaPadrao: 0.23, ivaAplicavelVendas: false, observacoes:'' },
     costs: [],
+    construcaoCustos: [],
     phases: [],
     houses: [],
     investors: [],
@@ -772,6 +773,83 @@ const CostEngine = (function(){
     return cost.valorBase;
   }
   return {distributeCost, distributionTotal};
+})();
+
+/* =========================================================================
+   CONSTRUCTION ENGINE (custos de construção — atividade separada, com margem
+   venda/construção por rubrica. Usa a mesma calendarização/forma de
+   distribuição de uma rubrica de Custos, mas aplicada a dois valores: o
+   valor de venda (com IVA, tal como nos Custos) e o valor de construção
+   (repartido pelos mesmos meses/proporções, sem IVA próprio).
+   ========================================================================= */
+const ConstructionEngine = (function(){
+  // repartição genérica: aplica a "forma" de uma rubrica (único/igual/manual/percentual)
+  // a um valor total qualquer, devolvendo um array indexado por mês absoluto.
+  function distributeByShape(item, totalValue, monthCount){
+    const arr = new Array(monthCount).fill(0);
+    const put = (mIdx, val)=>{
+      if(mIdx<0) mIdx=0;
+      if(mIdx>=monthCount) mIdx=monthCount-1;
+      arr[mIdx]+= val;
+    };
+    const mIni = item.mesInicio||0;
+    const mFim = (item.mesFim===undefined||item.mesFim===null)?mIni:item.mesFim;
+    if(item.distribuicao==='unico'){
+      put(mIni, totalValue);
+    } else if(item.distribuicao==='igual'){
+      const n = Math.max(1, mFim-mIni+1);
+      const parcela = totalValue/n;
+      for(let m=mIni;m<=mFim;m++) put(m, parcela);
+    } else if(item.distribuicao==='manual'){
+      const totalManual = Util.sum(item.manualValores||[], x=>x.valor||0);
+      (item.manualValores||[]).forEach(mv=>{
+        const frac = totalManual>0 ? (mv.valor||0)/totalManual : 0;
+        put(mv.mes, frac*totalValue);
+      });
+    } else if(item.distribuicao==='percentual'){
+      (item.percentuais||[]).forEach(pv=> put(pv.mes, (pv.perc||0)*totalValue));
+    }
+    return arr;
+  }
+  // devolve, por mês, {vendaBase, vendaCashIn, vendaEconomico, construcaoBase, lucro}
+  function distributeItem(item, monthCount){
+    const vendaBase = distributeByShape(item, item.valorVenda||0, monthCount);
+    const construcaoBase = distributeByShape(item, item.valorConstrucao||0, monthCount);
+    return vendaBase.map((v,i)=>{
+      const ivaSuportado = item.temIVA ? v*(item.taxaIVA||0) : 0;
+      let percDed = 0;
+      if(item.ivaDedutivel==='sim') percDed = 1;
+      else if(item.ivaDedutivel==='parcial') percDed = item.percDedutivel||0;
+      const ivaDedutivel = ivaSuportado*percDed;
+      const ivaNaoDedutivel = ivaSuportado-ivaDedutivel;
+      return {
+        vendaBase:v, vendaCashIn:v+ivaSuportado, vendaEconomico:v+ivaNaoDedutivel,
+        construcaoBase: construcaoBase[i], lucro: v-construcaoBase[i]
+      };
+    });
+  }
+  function build(project, monthCount){
+    const items = project.construcaoCustos||[];
+    const vendaMensal = new Array(monthCount).fill(0);
+    const construcaoMensal = new Array(monthCount).fill(0);
+    const lucroMensal = new Array(monthCount).fill(0);
+    const porCategoria = {}; // categoria -> {venda, construcao, lucro}
+    const breakdown = [];
+    items.forEach(item=>{
+      const arr = distributeItem(item, monthCount);
+      let totVenda=0, totConstrucao=0;
+      arr.forEach((s,i)=>{ vendaMensal[i]+=s.vendaCashIn; construcaoMensal[i]+=s.construcaoBase; lucroMensal[i]+=s.lucro; totVenda+=s.vendaCashIn; totConstrucao+=s.construcaoBase; });
+      if(!porCategoria[item.categoria]) porCategoria[item.categoria] = {venda:0, construcao:0, lucro:0};
+      porCategoria[item.categoria].venda += totVenda;
+      porCategoria[item.categoria].construcao += totConstrucao;
+      porCategoria[item.categoria].lucro += (totVenda-totConstrucao);
+      breakdown.push({id:item.id, categoria:item.categoria, descricao:item.descricao, venda:totVenda, construcao:totConstrucao, lucro:totVenda-totConstrucao});
+    });
+    let run=0; const acumulado = lucroMensal.map(v=>{ run+=v; return run; });
+    const totalVenda = Util.sum(vendaMensal), totalConstrucao = Util.sum(construcaoMensal), totalLucro = Util.sum(lucroMensal);
+    return { vendaMensal, construcaoMensal, lucroMensal, acumulado, porCategoria, breakdown, totalVenda, totalConstrucao, totalLucro };
+  }
+  return { distributeByShape, distributeItem, build };
 })();
 
 /* =========================================================================
@@ -1628,6 +1706,7 @@ const StorageEngine = (function(){
     // ponto de extensão para futuras migrações de schema
     if(!project.schemaVersion) project.schemaVersion = 1;
     if(!project.waterfall) project.waterfall = { ativo:false, ordem:['suprimentos','preferencial','capital','lucro','residual'] };
+    if(!project.construcaoCustos) project.construcaoCustos = [];
     (project.investors||[]).forEach(inv=>{
       if(inv.returnModel && inv.returnModel.penalizacaoSaidaAntecipada===undefined) inv.returnModel.penalizacaoSaidaAntecipada = null;
       if(inv.returnModel && inv.returnModel.premioPermanencia===undefined) inv.returnModel.premioPermanencia = null;
@@ -1658,28 +1737,31 @@ const StorageEngine = (function(){
 const NAV = [
   {id:'projetos', label:'Projetos', n:'01'},
   {id:'pressupostos', label:'Pressupostos', n:'02'},
-  {id:'custos', label:'Custos', n:'03'},
-  {id:'casas', label:'Casas / Vendas', n:'04'},
-  {id:'investidores', label:'Investidores', n:'05'},
-  {id:'financiamento', label:'Financiamento', n:'06'},
-  {id:'cashflow', label:'Cash-Flow', n:'07'},
-  {id:'cenarios', label:'Cenários', n:'08'},
-  {id:'promotor', label:'Análise Promotor', n:'09'},
-  {id:'investidor', label:'Análise Investidor', n:'10'},
-  {id:'relatorios', label:'Relatórios', n:'11'},
+  {id:'custosConstrucao', label:'Custos construção', n:'03'},
+  {id:'analiseConstrucao', label:'Análise construção', n:'04'},
+  {id:'custos', label:'Custos', n:'05'},
+  {id:'casas', label:'Casas / Vendas', n:'06'},
+  {id:'investidores', label:'Investidores', n:'07'},
+  {id:'financiamento', label:'Financiamento', n:'08'},
+  {id:'cashflow', label:'Cash-Flow', n:'09'},
+  {id:'cenarios', label:'Cenários', n:'10'},
+  {id:'promotor', label:'Análise Promotor', n:'11'},
+  {id:'investidor', label:'Análise Investidor', n:'12'},
+  {id:'relatorios', label:'Relatórios', n:'13'},
 ];
 
 const UI = { activeView:'projetos', activeInvestorId:null, charts:{}, readOnly:false };
 
 function visibleNav(){
-  if(Auth.isAdmin()) return NAV.concat([{id:'contas', label:'Contas', n:'12'}]);
+  if(Auth.isAdmin()) return NAV;
   const allowed = Auth.allowedViews();
   return NAV.filter(n=> allowed.includes(n.id));
 }
 
 function render(){
   const nav = visibleNav();
-  if(!nav.some(n=>n.id===UI.activeView)) UI.activeView = nav.length ? nav[0].id : null;
+  const isContasSpecial = UI.activeView==='contas' && Auth.isAdmin();
+  if(!nav.some(n=>n.id===UI.activeView) && !isContasSpecial) UI.activeView = nav.length ? nav[0].id : null;
   renderSidebar();
   renderTopbar();
   renderContent();
@@ -1719,10 +1801,12 @@ function renderTopbar(){
     <button class="tb-btn" id="btnSaveProject">Guardar projeto</button>
     <div style="display:flex;align-items:center;gap:8px;padding-left:6px;border-left:1px solid var(--border);">
       <span class="mono" style="font-size:11px;color:var(--ink-faint);" title="Sessão iniciada com">${Util.escapeHtml(Auth.email()||'')}</span>
+      ${isAdmin?`<button class="tb-btn ${UI.activeView==='contas'?'primary':''}" id="btnContas" title="Gestão de contas (admin)">⚙ Contas</button>`:''}
       <button class="tb-btn" id="btnLogout">Sair</button>
     </div>
   `;
   tb.querySelector('#btnLogout').onclick = ()=> Auth.signOut();
+  if(isAdmin) tb.querySelector('#btnContas').onclick = ()=>{ UI.activeView='contas'; render(); };
   tb.querySelector('#projSelect').onchange = e=> Store.setActive(e.target.value);
   tb.querySelectorAll('#scenPicker button').forEach(b=> b.onclick = ()=> Store.setScenario(b.dataset.s));
   tb.querySelector('#btnSaveProject').onclick = async ()=>{
@@ -1796,12 +1880,14 @@ function renderContent(){
   const cf = computeCF();
   const alerts = ValidationEngine.run(cf.proj, cf);
   let html = '';
-  if(['cashflow','promotor','investidor','custos','casas','investidores','financiamento'].includes(UI.activeView) && alerts.length){
+  if(['cashflow','promotor','investidor','custos','custosConstrucao','casas','investidores','financiamento'].includes(UI.activeView) && alerts.length){
     html += '<div class="alerts">' + alerts.slice(0,6).map(a=>`<div class="alert ${a.nivel==='bad'?'bad':''}">${Util.escapeHtml(a.msg)}</div>`).join('') + (alerts.length>6?`<div class="alert">+ ${alerts.length-6} outro(s) alerta(s).</div>`:'') + '</div>';
   }
   switch(UI.activeView){
     case 'projetos': html += viewProjetos(p); break;
     case 'pressupostos': html += viewPressupostos(p); break;
+    case 'custosConstrucao': html += viewCustosConstrucao(p); break;
+    case 'analiseConstrucao': html += viewAnaliseConstrucao(p, cf); break;
     case 'custos': html += viewCustos(p, cf); break;
     case 'casas': html += viewCasas(p, cf); break;
     case 'investidores': html += viewInvestidores(p, cf); break;
@@ -1814,7 +1900,7 @@ function renderContent(){
   }
   c.innerHTML = html;
   wireView(UI.activeView, p, cf);
-  const editableViews = ['projetos','pressupostos','custos','casas','investidores','financiamento','cenarios'];
+  const editableViews = ['projetos','pressupostos','custosConstrucao','custos','casas','investidores','financiamento','cenarios'];
   UI.readOnly = editableViews.includes(UI.activeView) && !Auth.isAdmin() && !Auth.canEditProject(p.id);
   applyReadOnlyGate();
 }
@@ -1967,7 +2053,7 @@ function costEditorModal(cost, onSave){
   const isNew = !cost;
   const c = cost ? Util.deepClone(cost) : {id:Util.uid(),categoria:CATEGORIAS_DEFAULT[0],subcategoria:'',descricao:'',fornecedor:'',valorBase:0,temIVA:true,taxaIVA:0.23,ivaDedutivel:'sim',percDedutivel:1,mesInicio:0,mesFim:0,distribuicao:'unico',manualValores:[],percentuais:[],observacoes:''};
   const projActivo = Store.active();
-  const categoriasExistentes = projActivo ? projActivo.costs.map(x=>x.categoria).filter(Boolean) : [];
+  const categoriasExistentes = projActivo ? [...projActivo.costs.map(x=>x.categoria), ...(projActivo.construcaoCustos||[]).map(x=>x.categoria)].filter(Boolean) : [];
   const categoriasCombo = Array.from(new Set([...CATEGORIAS_DEFAULT, ...categoriasExistentes]));
   const back = openModal(`
     <h3>${isNew?'Novo custo':'Editar custo'}</h3>
@@ -2090,6 +2176,207 @@ function costEditorModal(cost, onSave){
       closeModals();
     };
   });
+}
+
+/* =========================================================================
+   VIEW: CUSTOS CONSTRUÇÃO (atividade de construção separada — margem
+   venda/construção por rubrica, não entra no cash-flow geral do projeto)
+   ========================================================================= */
+function viewCustosConstrucao(p){
+  const items = p.construcaoCustos||[];
+  const totalVenda = Util.sum(items, x=>x.valorVenda||0);
+  const totalConstrucao = Util.sum(items, x=>x.valorConstrucao||0);
+  const rows = items.map((c,idx)=>{
+    const lucro = (c.valorVenda||0)-(c.valorConstrucao||0);
+    return `<tr data-id="${c.id}">
+      <td class="num mono" style="color:var(--ink-faint);">
+        <div style="display:flex;align-items:center;gap:2px;">
+          <button class="icon-btn" data-act="up" title="Mover para cima" ${idx===0?'disabled':''}>↑</button>
+          <button class="icon-btn" data-act="down" title="Mover para baixo" ${idx===items.length-1?'disabled':''}>↓</button>
+        </div>
+      </td>
+      <td>${Util.escapeHtml(c.categoria)}</td>
+      <td>${Util.escapeHtml(c.subcategoria||'')}</td>
+      <td>${Util.escapeHtml(c.descricao||'')}</td>
+      <td class="num mono">${Util.fmtMoney0(c.valorVenda)}</td>
+      <td class="num mono">${Util.fmtMoney0(c.valorConstrucao)}</td>
+      <td class="num mono" style="${lucro<0?'color:var(--neg)':''}">${Util.fmtMoney0(lucro)}</td>
+      <td>${c.distribuicao}</td>
+      <td class="num mono">${c.mesInicio}</td>
+      <td class="row-actions">
+        <button class="icon-btn" data-act="edit">Editar</button>
+        <button class="icon-btn" data-act="dup">Duplicar</button>
+        <button class="icon-btn danger" data-act="del">Eliminar</button>
+      </td>
+    </tr>`;
+  }).join('');
+  return `
+  <div class="view-head"><div><h2>Custos construção</h2><p>Atividade de construção separada da promoção: cada rubrica tem um valor de venda e um valor de construção, para acompanhar a margem por categoria. Não entra no cash-flow geral do projeto — vê a análise em "Análise construção".</p></div>
+    <button class="tb-btn primary" id="btnAddCustoConstrucao">+ Adicionar custo</button>
+  </div>
+  <div class="kpis">
+    <div class="kpi"><div class="k-label">Total de venda</div><div class="k-value">${Util.fmtMoney0(totalVenda)}</div></div>
+    <div class="kpi"><div class="k-label">Total de construção</div><div class="k-value">${Util.fmtMoney0(totalConstrucao)}</div></div>
+    <div class="kpi"><div class="k-label">Lucro total</div><div class="k-value ${totalVenda-totalConstrucao<0?'neg':'pos'}">${Util.fmtMoney0(totalVenda-totalConstrucao)}</div></div>
+    <div class="kpi"><div class="k-label">Nº de rubricas</div><div class="k-value">${items.length}</div></div>
+  </div>
+  <div class="tbl-wrap"><table class="data">
+    <thead><tr><th></th><th>Categoria</th><th>Subcategoria</th><th>Descrição</th><th class="num">Valor de venda</th><th class="num">Valor de construção</th><th class="num">Lucro</th><th>Distribuição</th><th class="num">Mês início</th><th></th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="10" class="empty">Sem custos de construção registados.</td></tr>'}</tbody>
+  </table></div>`;
+}
+
+function custoConstrucaoEditorModal(cost, onSave){
+  const isNew = !cost;
+  const c = cost ? Util.deepClone(cost) : {id:Util.uid(),categoria:CATEGORIAS_DEFAULT[0],subcategoria:'',descricao:'',fornecedor:'',valorVenda:0,valorConstrucao:0,temIVA:true,taxaIVA:0.23,ivaDedutivel:'sim',percDedutivel:1,mesInicio:0,mesFim:0,distribuicao:'unico',manualValores:[],percentuais:[],observacoes:''};
+  const projActivo = Store.active();
+  const categoriasExistentes = projActivo ? (projActivo.construcaoCustos||[]).map(x=>x.categoria).filter(Boolean) : [];
+  const categoriasCombo = Array.from(new Set([...CATEGORIAS_DEFAULT, ...categoriasExistentes]));
+  openModal(`
+    <h3>${isNew?'Novo custo de construção':'Editar custo de construção'}</h3>
+    <div class="grid cols-2" style="margin-top:10px;">
+      <div class="field"><label>Categoria</label>
+        <select id="cc_categoria">
+          ${categoriasCombo.map(x=>`<option value="${Util.escapeHtml(x)}" ${x===c.categoria?'selected':''}>${Util.escapeHtml(x)}</option>`).join('')}
+          <option value="__nova__">+ Nova categoria…</option>
+        </select>
+        <input id="cc_categoria_nova" placeholder="Nome da nova categoria" style="display:none;margin-top:6px;">
+      </div>
+      <div class="field"><label>Subcategoria</label><input id="cc_subcategoria" value="${Util.escapeHtml(c.subcategoria)}"></div>
+      <div class="field" style="grid-column:1/3;"><label>Descrição</label><input id="cc_descricao" value="${Util.escapeHtml(c.descricao)}"></div>
+      <div class="field"><label>Fornecedor (opcional)</label><input id="cc_fornecedor" value="${Util.escapeHtml(c.fornecedor)}"></div>
+      <div class="field"><label>Valor de venda (€)</label><input type="number" step="0.01" id="cc_valorVenda" value="${c.valorVenda}"></div>
+      <div class="field"><label>Valor de construção (€)</label><input type="number" step="0.01" id="cc_valorConstrucao" value="${c.valorConstrucao}"></div>
+      <div class="field"><label class="inline"><input type="checkbox" id="cc_temIVA" ${c.temIVA?'checked':''}> Tem IVA (sobre a venda)</label></div>
+      <div class="field"><label>Taxa de IVA</label><input type="number" step="0.01" id="cc_taxaIVA" value="${(c.taxaIVA*100).toFixed(2)}"></div>
+      <div class="field"><label>IVA dedutível</label><select id="cc_ivaDedutivel">
+        <option value="sim" ${c.ivaDedutivel==='sim'?'selected':''}>Sim</option>
+        <option value="nao" ${c.ivaDedutivel==='nao'?'selected':''}>Não</option>
+        <option value="parcial" ${c.ivaDedutivel==='parcial'?'selected':''}>Parcial</option>
+      </select></div>
+      <div class="field"><label>% dedutível (se parcial)</label><input type="number" step="0.01" id="cc_percDedutivel" value="${(c.percDedutivel*100).toFixed(0)}"></div>
+      <div class="field"><label>Mês de início (0 = 1º mês do projeto)</label><input type="number" id="cc_mesInicio" value="${c.mesInicio}"></div>
+      <div class="field"><label>Mês de fim</label><input type="number" id="cc_mesFim" value="${c.mesFim}"></div>
+      <div class="field"><label>Forma de distribuição</label><select id="cc_distribuicao">
+        <option value="unico" ${c.distribuicao==='unico'?'selected':''}>Pagamento único</option>
+        <option value="igual" ${c.distribuicao==='igual'?'selected':''}>Distribuição igual pelos meses</option>
+        <option value="manual" ${c.distribuicao==='manual'?'selected':''}>Distribuição manual</option>
+        <option value="percentual" ${c.distribuicao==='percentual'?'selected':''}>Distribuição percentual</option>
+      </select></div>
+    </div>
+    <p style="color:var(--ink-soft);font-size:12px;margin-top:6px;">A forma de distribuição aplica-se em simultâneo ao valor de venda e ao valor de construção (mesma calendarização para os dois).</p>
+    <div id="ccDistEditorArea" style="margin-top:10px;"></div>
+    <div class="field" style="margin-top:10px;"><label>Observações</label><textarea id="cc_observacoes" rows="2">${Util.escapeHtml(c.observacoes)}</textarea></div>
+    <div class="modal-foot"><button class="tb-btn" id="btnCancel">Cancelar</button><button class="tb-btn primary" id="btnSave">Guardar</button></div>
+  `, (modalEl)=>{
+    function renderDistArea(){
+      const dist = modalEl.querySelector('#cc_distribuicao').value;
+      const area = modalEl.querySelector('#ccDistEditorArea');
+      if(dist==='manual'){
+        area.innerHTML = `<div class="section-sub">Distribuição manual por mês (peso relativo por mês — as proporções entre linhas aplicam-se tanto à venda como à construção)</div>
+          <div id="ccManualRows"></div>
+          <button class="icon-btn" id="ccAddManualRow">+ Adicionar mês</button>`;
+        const rowsWrap = area.querySelector('#ccManualRows');
+        function paintManual(){
+          rowsWrap.innerHTML = (c.manualValores||[]).map((mv,i)=>`
+            <div class="grid cols-3" style="margin-bottom:6px;">
+              <input type="number" data-mi="${i}" class="ccmv-mes" placeholder="Mês" value="${mv.mes}">
+              <input type="number" step="0.01" data-mi="${i}" class="ccmv-valor" placeholder="Peso (ex: valor de venda desse mês)" value="${mv.valor}">
+              <button class="icon-btn danger" data-mi="${i}" id="ccRmMv">Remover</button>
+            </div>`).join('');
+          rowsWrap.querySelectorAll('.ccmv-mes').forEach(inp=> inp.onchange=()=>{ c.manualValores[+inp.dataset.mi].mes = +inp.value; });
+          rowsWrap.querySelectorAll('.ccmv-valor').forEach(inp=> inp.onchange=()=>{ c.manualValores[+inp.dataset.mi].valor = +inp.value; });
+          rowsWrap.querySelectorAll('#ccRmMv').forEach(btn=> btn.onclick=()=>{ c.manualValores.splice(+btn.dataset.mi,1); paintManual(); });
+        }
+        area.querySelector('#ccAddManualRow').onclick = ()=>{ c.manualValores.push({mes:0,valor:0}); paintManual(); };
+        paintManual();
+      } else if(dist==='percentual'){
+        area.innerHTML = `<div class="section-sub">Distribuição percentual por mês (deve somar 100%)</div>
+          <div id="ccPercRows"></div>
+          <button class="icon-btn" id="ccAddPercRow">+ Adicionar mês</button>
+          <div class="methodology" id="ccPercSum"></div>`;
+        const rowsWrap = area.querySelector('#ccPercRows');
+        function paintPerc(){
+          rowsWrap.innerHTML = (c.percentuais||[]).map((pv,i)=>`
+            <div class="grid cols-3" style="margin-bottom:6px;">
+              <input type="number" data-pi="${i}" class="ccpv-mes" placeholder="Mês" value="${pv.mes}">
+              <input type="number" step="0.01" data-pi="${i}" class="ccpv-perc" placeholder="%" value="${(pv.perc*100).toFixed(2)}">
+              <button class="icon-btn danger" data-pi="${i}" id="ccRmPv">Remover</button>
+            </div>`).join('');
+          rowsWrap.querySelectorAll('.ccpv-mes').forEach(inp=> inp.onchange=()=>{ c.percentuais[+inp.dataset.pi].mes = +inp.value; updateSum(); });
+          rowsWrap.querySelectorAll('.ccpv-perc').forEach(inp=> inp.onchange=()=>{ c.percentuais[+inp.dataset.pi].perc = (+inp.value)/100; updateSum(); });
+          rowsWrap.querySelectorAll('#ccRmPv').forEach(btn=> btn.onclick=()=>{ c.percentuais.splice(+btn.dataset.pi,1); paintPerc(); updateSum(); });
+          updateSum();
+        }
+        function updateSum(){
+          const soma = Util.sum(c.percentuais||[], x=>x.perc||0);
+          area.querySelector('#ccPercSum').innerHTML = `Soma: <strong>${Util.fmtPct(soma)}</strong> ${Math.abs(soma-1)>0.005?'<span class="tag bad">deve ser 100%</span>':'<span class="tag ok">ok</span>'}`;
+        }
+        area.querySelector('#ccAddPercRow').onclick = ()=>{ c.percentuais.push({mes:0,perc:0}); paintPerc(); };
+        paintPerc();
+      } else {
+        area.innerHTML = '';
+      }
+    }
+    modalEl.querySelector('#cc_distribuicao').onchange = renderDistArea;
+    renderDistArea();
+    const catSelectEl = modalEl.querySelector('#cc_categoria');
+    const catNovaEl = modalEl.querySelector('#cc_categoria_nova');
+    function toggleCategoriaNova(){
+      if(catSelectEl.value==='__nova__'){ catNovaEl.style.display='block'; catNovaEl.focus(); }
+      else { catNovaEl.style.display='none'; }
+    }
+    catSelectEl.onchange = toggleCategoriaNova;
+    toggleCategoriaNova();
+    modalEl.closest('.modal-backdrop').querySelector('#btnCancel').onclick = closeModals;
+    modalEl.closest('.modal-backdrop').querySelector('#btnSave').onclick = ()=>{
+      const catSel = modalEl.querySelector('#cc_categoria').value;
+      c.categoria = catSel==='__nova__' ? (modalEl.querySelector('#cc_categoria_nova').value.trim()||'Outros') : catSel;
+      c.subcategoria = modalEl.querySelector('#cc_subcategoria').value;
+      c.descricao = modalEl.querySelector('#cc_descricao').value;
+      c.fornecedor = modalEl.querySelector('#cc_fornecedor').value;
+      c.valorVenda = +modalEl.querySelector('#cc_valorVenda').value||0;
+      c.valorConstrucao = +modalEl.querySelector('#cc_valorConstrucao').value||0;
+      c.temIVA = modalEl.querySelector('#cc_temIVA').checked;
+      c.taxaIVA = (+modalEl.querySelector('#cc_taxaIVA').value||0)/100;
+      c.ivaDedutivel = modalEl.querySelector('#cc_ivaDedutivel').value;
+      c.percDedutivel = (+modalEl.querySelector('#cc_percDedutivel').value||0)/100;
+      c.mesInicio = +modalEl.querySelector('#cc_mesInicio').value||0;
+      c.mesFim = +modalEl.querySelector('#cc_mesFim').value||0;
+      c.distribuicao = modalEl.querySelector('#cc_distribuicao').value;
+      c.observacoes = modalEl.querySelector('#cc_observacoes').value;
+      onSave(c);
+      closeModals();
+    };
+  });
+}
+
+/* =========================================================================
+   VIEW: ANÁLISE CONSTRUÇÃO
+   ========================================================================= */
+function viewAnaliseConstrucao(p, cf){
+  const ce = ConstructionEngine.build(p, cf.monthCount);
+  const labels = Array.from({length:cf.monthCount},(_,i)=>Util.monthLabel(cf.start,i));
+  const catLabels = Object.keys(ce.porCategoria);
+  const margem = ce.totalVenda>0 ? ce.totalLucro/ce.totalVenda : null;
+  return `
+  <div class="view-head"><div><h2>Análise construção</h2><p>Cash-flow e margem da atividade de construção (separada do cash-flow geral do projeto), com base nas rubricas da aba "Custos construção".</p></div></div>
+  <div class="kpis">
+    <div class="kpi"><div class="k-label">Total de venda</div><div class="k-value">${Util.fmtMoney0(ce.totalVenda)}</div></div>
+    <div class="kpi"><div class="k-label">Total de construção</div><div class="k-value">${Util.fmtMoney0(ce.totalConstrucao)}</div></div>
+    <div class="kpi"><div class="k-label">Lucro total</div><div class="k-value ${ce.totalLucro<0?'neg':'pos'}">${Util.fmtMoney0(ce.totalLucro)}</div></div>
+    <div class="kpi"><div class="k-label">Margem</div><div class="k-value">${margem!==null?Util.fmtPct(margem):'—'}</div></div>
+  </div>
+  <div class="card"><h3>Cash-flow da construção (venda vs construção, mensal e acumulado)</h3><div class="chart-box"><canvas id="chartConstrucaoCF"></canvas></div></div>
+  <div class="card"><h3>Venda, construção e lucro por categoria</h3><div class="chart-box"><canvas id="chartConstrucaoCat"></canvas></div></div>
+  <div class="tbl-wrap"><table class="data">
+    <thead><tr><th>Categoria</th><th class="num">Venda</th><th class="num">Construção</th><th class="num">Lucro</th><th class="num">Margem</th></tr></thead>
+    <tbody>${catLabels.length?catLabels.map(k=>{
+      const v = ce.porCategoria[k];
+      const m = v.venda>0 ? v.lucro/v.venda : null;
+      return `<tr><td>${Util.escapeHtml(k)}</td><td class="num mono">${Util.fmtMoney0(v.venda)}</td><td class="num mono">${Util.fmtMoney0(v.construcao)}</td><td class="num mono" style="${v.lucro<0?'color:var(--neg)':''}">${Util.fmtMoney0(v.lucro)}</td><td class="num mono">${m!==null?Util.fmtPct(m):'—'}</td></tr>`;
+    }).join(''):'<tr><td colspan="5" class="empty">Sem custos de construção registados.</td></tr>'}</tbody>
+  </table></div>`;
 }
 
 /* =========================================================================
@@ -2985,6 +3272,58 @@ function wireView(view, p, cf){
       });
       toast('Pressupostos guardados.');
     };
+  }
+  if(view==='custosConstrucao'){
+    document.getElementById('btnAddCustoConstrucao').onclick = ()=> custoConstrucaoEditorModal(null, (c)=>{
+      Store.update(pr=>{ if(!pr.construcaoCustos) pr.construcaoCustos=[]; pr.construcaoCustos.push(c); }); toast('Custo de construção adicionado.');
+    });
+    document.querySelectorAll('#content tbody tr[data-id]').forEach(tr=>{
+      const id = tr.dataset.id;
+      tr.querySelector('[data-act="edit"]').onclick = ()=>{
+        const cost = Store.active().construcaoCustos.find(c=>c.id===id);
+        custoConstrucaoEditorModal(cost, (updated)=>{ Store.update(pr=>{ const i=pr.construcaoCustos.findIndex(c=>c.id===id); pr.construcaoCustos[i]=updated; }); toast('Custo de construção atualizado.'); });
+      };
+      tr.querySelector('[data-act="dup"]').onclick = ()=>{
+        Store.update(pr=>{ const c = Util.deepClone(pr.construcaoCustos.find(c=>c.id===id)); c.id=Util.uid(); c.descricao+=' (cópia)'; pr.construcaoCustos.push(c); });
+        toast('Custo de construção duplicado.');
+      };
+      tr.querySelector('[data-act="del"]').onclick = ()=>{
+        if(confirm('Eliminar este custo de construção?')) Store.update(pr=>{ pr.construcaoCustos = pr.construcaoCustos.filter(c=>c.id!==id); });
+      };
+      const upBtn = tr.querySelector('[data-act="up"]');
+      const downBtn = tr.querySelector('[data-act="down"]');
+      if(upBtn) upBtn.onclick = ()=> Store.update(pr=>{
+        const i = pr.construcaoCustos.findIndex(c=>c.id===id);
+        if(i>0) [pr.construcaoCustos[i-1],pr.construcaoCustos[i]] = [pr.construcaoCustos[i],pr.construcaoCustos[i-1]];
+      });
+      if(downBtn) downBtn.onclick = ()=> Store.update(pr=>{
+        const i = pr.construcaoCustos.findIndex(c=>c.id===id);
+        if(i<pr.construcaoCustos.length-1) [pr.construcaoCustos[i+1],pr.construcaoCustos[i]] = [pr.construcaoCustos[i],pr.construcaoCustos[i+1]];
+      });
+    });
+  }
+  if(view==='analiseConstrucao'){
+    const ce = ConstructionEngine.build(p, cf.monthCount);
+    const labels = Array.from({length:cf.monthCount},(_,i)=>Util.monthLabel(cf.start,i));
+    let run=0; const construcaoAcumulado = ce.lucroMensal.map(v=>{ run+=v; return run; });
+    UI.charts.construcaoCF = new Chart(document.getElementById('chartConstrucaoCF'), {
+      data:{ labels, datasets:[
+        {type:'bar', label:'Venda', data:ce.vendaMensal, backgroundColor:C.accent},
+        {type:'bar', label:'Construção', data:ce.construcaoMensal.map(v=>-v), backgroundColor:C.neg},
+        {type:'line', label:'Lucro acumulado', data:construcaoAcumulado, borderColor:C.gold, backgroundColor:'transparent', tension:0.15}
+      ]},
+      options:{responsive:true, maintainAspectRatio:false, scales:{ x:{grid:{display:false}}, y:{grid:{color:C.grid}} }, plugins:{legend:{labels:{color:C.ink}}} }
+    });
+    const catLabels = Object.keys(ce.porCategoria);
+    UI.charts.construcaoCat = new Chart(document.getElementById('chartConstrucaoCat'), {
+      type:'bar',
+      data:{ labels:catLabels, datasets:[
+        {label:'Venda', data:catLabels.map(k=>ce.porCategoria[k].venda), backgroundColor:C.accent},
+        {label:'Construção', data:catLabels.map(k=>ce.porCategoria[k].construcao), backgroundColor:C.neg},
+        {label:'Lucro', data:catLabels.map(k=>ce.porCategoria[k].lucro), backgroundColor:C.gold},
+      ]},
+      options:{responsive:true, maintainAspectRatio:false, scales:{ x:{grid:{display:false}}, y:{grid:{color:C.grid}} }, plugins:{legend:{labels:{color:C.ink}}} }
+    });
   }
   if(view==='custos'){
     document.getElementById('btnAddCost').onclick = ()=> costEditorModal(null, (c)=>{
