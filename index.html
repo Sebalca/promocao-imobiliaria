@@ -2122,6 +2122,7 @@ function viewCasas(p, cf){
   <div class="view-head"><div><h2>Casas / Vendas</h2><p>Cada moradia com o seu próprio plano de pagamentos, alimentando automaticamente o cash-flow.</p></div>
     <div class="small-btn-row">
       <button class="tb-btn" id="btnBulkAdd">+ Adicionar várias</button>
+      <button class="tb-btn" id="btnApplyPlan">Aplicar plano de pagamentos a uma fase</button>
       <button class="tb-btn" id="btnManagePhases">Gerir fases</button>
       <button class="tb-btn primary" id="btnAddHouse">+ Adicionar casa</button>
     </div>
@@ -2219,8 +2220,14 @@ function paymentsEditorModal(house, onSave){
   });
 }
 
-function bulkAddHousesModal(phases, onSave){
-  openModal(`
+function bulkAddHousesModal(phases, project, onSave){
+  const dataVendaDefault = Util.addMonths(project.assumptions.dataInicio, 12);
+  const plano = [
+    {nome:'CPCV', percentagem:0.10, dataPrevista: project.assumptions.dataInicio, estado:'prevista'},
+    {nome:'Meio da obra', percentagem:0.40, dataPrevista: Util.addMonths(project.assumptions.dataInicio,6), estado:'prevista'},
+    {nome:'Escritura', percentagem:0.50, dataPrevista: dataVendaDefault, estado:'prevista'},
+  ];
+  const back = openModal(`
     <h3>Adicionar várias casas</h3>
     <div class="grid cols-2" style="margin-top:10px;">
       <div class="field"><label>Quantidade</label><input type="number" id="b_qtd" value="10"></div>
@@ -2229,9 +2236,37 @@ function bulkAddHousesModal(phases, onSave){
       <div class="field"><label>Tipologia</label><input id="b_tipologia" value="T3"></div>
       <div class="field"><label>Área (m²)</label><input type="number" id="b_area" value="150"></div>
       <div class="field"><label>Preço de venda previsto (€)</label><input type="number" id="b_preco" value="280000"></div>
+      <div class="field"><label>Data prevista de venda</label><input type="date" id="b_dataVenda" value="${dataVendaDefault}"></div>
     </div>
+    <div class="section-sub" style="margin-top:14px;">Plano de pagamentos (aplicado a todas as casas criadas)</div>
+    <p style="color:var(--ink-soft);font-size:12px;margin:2px 0 8px;">O valor de cada etapa é calculado como % do preço de venda previsto acima.</p>
+    <div id="planRows"></div>
+    <button class="icon-btn" id="addPlanRow">+ Adicionar etapa</button>
+    <div class="methodology" id="planSum"></div>
     <div class="modal-foot"><button class="tb-btn" id="btnCancel">Cancelar</button><button class="tb-btn primary" id="btnSave">Criar casas</button></div>
   `, (modalEl)=>{
+    const wrap = modalEl.querySelector('#planRows');
+    const estados = ['prevista','paga'];
+    function paint(){
+      wrap.innerHTML = plano.map((pl,i)=>`
+        <div class="grid cols-4" style="margin-bottom:8px;align-items:end;">
+          <div class="field"><label>Nome</label><input class="pl-nome" data-i="${i}" value="${Util.escapeHtml(pl.nome)}"></div>
+          <div class="field"><label>% do preço</label><input type="number" step="0.01" class="pl-perc" data-i="${i}" value="${(pl.percentagem*100).toFixed(2)}"></div>
+          <div class="field"><label>Data prevista</label><input type="date" class="pl-data" data-i="${i}" value="${pl.dataPrevista||''}"></div>
+          <button class="icon-btn danger" data-i="${i}" id="rmPlanRow">Remover</button>
+        </div>`).join('');
+      wrap.querySelectorAll('.pl-nome').forEach(el=> el.onchange=()=>{ plano[+el.dataset.i].nome = el.value; });
+      wrap.querySelectorAll('.pl-perc').forEach(el=> el.onchange=()=>{ plano[+el.dataset.i].percentagem = (+el.value)/100; updateSum(); });
+      wrap.querySelectorAll('.pl-data').forEach(el=> el.onchange=()=>{ plano[+el.dataset.i].dataPrevista = el.value; });
+      wrap.querySelectorAll('#rmPlanRow').forEach(btn=> btn.onclick=()=>{ plano.splice(+btn.dataset.i,1); paint(); updateSum(); });
+      updateSum();
+    }
+    function updateSum(){
+      const soma = Util.sum(plano, x=>x.percentagem||0);
+      modalEl.querySelector('#planSum').innerHTML = `Soma das percentagens: <strong>${Util.fmtPct(soma)}</strong> ${Math.abs(soma-1)>0.005?'<span class="tag bad">≠ 100%</span>':'<span class="tag ok">100%</span>'}`;
+    }
+    modalEl.querySelector('#addPlanRow').onclick = ()=>{ plano.push({nome:'Nova etapa',percentagem:0,dataPrevista:'',estado:'prevista'}); paint(); };
+    paint();
     modalEl.closest('.modal-backdrop').querySelector('#btnCancel').onclick = closeModals;
     modalEl.closest('.modal-backdrop').querySelector('#btnSave').onclick = ()=>{
       const qtd = +modalEl.querySelector('#b_qtd').value||1;
@@ -2240,7 +2275,54 @@ function bulkAddHousesModal(phases, onSave){
       const tipologia = modalEl.querySelector('#b_tipologia').value;
       const area = +modalEl.querySelector('#b_area').value||0;
       const preco = +modalEl.querySelector('#b_preco').value||0;
-      onSave({qtd,prefixo,faseId,tipologia,area,preco});
+      const dataVenda = modalEl.querySelector('#b_dataVenda').value||dataVendaDefault;
+      onSave({qtd,prefixo,faseId,tipologia,area,preco,dataVenda,plano:Util.deepClone(plano)});
+      closeModals();
+    };
+  });
+}
+
+function applyPaymentPlanModal(phases, onApply){
+  const plano = [
+    {nome:'CPCV', percentagem:0.10, dataPrevista:'', estado:'prevista'},
+    {nome:'Meio da obra', percentagem:0.40, dataPrevista:'', estado:'prevista'},
+    {nome:'Escritura', percentagem:0.50, dataPrevista:'', estado:'prevista'},
+  ];
+  openModal(`
+    <h3>Aplicar plano de pagamentos a uma fase</h3>
+    <p style="color:var(--ink-soft);font-size:12px;">Substitui o plano de pagamentos de todas as casas da fase escolhida (mesmo as já criadas). O valor de cada etapa é calculado como % do preço de venda de cada casa (efetivo, ou previsto se ainda não houver efetivo).</p>
+    <div class="field"><label>Fase</label><select id="ap_fase">${phases.map(f=>`<option value="${f.id}">${Util.escapeHtml(f.nome)}</option>`).join('')}</select></div>
+    <div class="section-sub" style="margin-top:10px;">Plano de pagamentos</div>
+    <div id="apRows"></div>
+    <button class="icon-btn" id="addApRow">+ Adicionar etapa</button>
+    <div class="methodology" id="apSum"></div>
+    <div class="modal-foot"><button class="tb-btn" id="btnCancel">Cancelar</button><button class="tb-btn primary" id="btnSave">Aplicar a todas as casas da fase</button></div>
+  `, (modalEl)=>{
+    const wrap = modalEl.querySelector('#apRows');
+    function paint(){
+      wrap.innerHTML = plano.map((pl,i)=>`
+        <div class="grid cols-4" style="margin-bottom:8px;align-items:end;">
+          <div class="field"><label>Nome</label><input class="ap-nome" data-i="${i}" value="${Util.escapeHtml(pl.nome)}"></div>
+          <div class="field"><label>% do preço</label><input type="number" step="0.01" class="ap-perc" data-i="${i}" value="${(pl.percentagem*100).toFixed(2)}"></div>
+          <div class="field"><label>Data prevista</label><input type="date" class="ap-data" data-i="${i}" value="${pl.dataPrevista||''}"></div>
+          <button class="icon-btn danger" data-i="${i}" id="rmApRow">Remover</button>
+        </div>`).join('');
+      wrap.querySelectorAll('.ap-nome').forEach(el=> el.onchange=()=>{ plano[+el.dataset.i].nome = el.value; });
+      wrap.querySelectorAll('.ap-perc').forEach(el=> el.onchange=()=>{ plano[+el.dataset.i].percentagem = (+el.value)/100; updateSum(); });
+      wrap.querySelectorAll('.ap-data').forEach(el=> el.onchange=()=>{ plano[+el.dataset.i].dataPrevista = el.value; });
+      wrap.querySelectorAll('#rmApRow').forEach(btn=> btn.onclick=()=>{ plano.splice(+btn.dataset.i,1); paint(); updateSum(); });
+      updateSum();
+    }
+    function updateSum(){
+      const soma = Util.sum(plano, x=>x.percentagem||0);
+      modalEl.querySelector('#apSum').innerHTML = `Soma das percentagens: <strong>${Util.fmtPct(soma)}</strong> ${Math.abs(soma-1)>0.005?'<span class="tag bad">≠ 100%</span>':'<span class="tag ok">100%</span>'}`;
+    }
+    modalEl.querySelector('#addApRow').onclick = ()=>{ plano.push({nome:'Nova etapa',percentagem:0,dataPrevista:'',estado:'prevista'}); paint(); };
+    paint();
+    modalEl.closest('.modal-backdrop').querySelector('#btnCancel').onclick = closeModals;
+    modalEl.closest('.modal-backdrop').querySelector('#btnSave').onclick = ()=>{
+      const faseId = modalEl.querySelector('#ap_fase').value;
+      onApply({faseId, plano:Util.deepClone(plano)});
       closeModals();
     };
   });
@@ -2935,26 +3017,37 @@ function wireView(view, p, cf){
   }
   if(view==='casas'){
     document.getElementById('btnAddHouse').onclick = ()=> houseEditorModal(null, p.phases, (h)=>{ Store.update(pr=>pr.houses.push(h)); toast('Casa adicionada.'); });
-    document.getElementById('btnBulkAdd').onclick = ()=> bulkAddHousesModal(p.phases, (opts)=>{
+    document.getElementById('btnBulkAdd').onclick = ()=> bulkAddHousesModal(p.phases, p, (opts)=>{
       Store.update(pr=>{
         const startN = pr.houses.length+1;
         for(let i=0;i<opts.qtd;i++){
           const ref = opts.prefixo+' '+String(startN+i).padStart(2,'0');
-          const dataV = Util.addMonths(pr.assumptions.dataInicio, 12);
           pr.houses.push({
             id:Util.uid(), referencia:ref, faseId:opts.faseId, tipologia:opts.tipologia, area:opts.area, estado:'Planeada',
             custoConstrucaoPrevisto: opts.preco*0.5, precoVendaPrevisto: opts.preco, precoVendaEfetivo:null,
-            dataVendaPrevista: dataV, dataVendaEfetiva:null, observacoes:'', ignorarValidacao100:false,
-            pagamentos:[
-              {id:Util.uid(),nome:'CPCV',percentagem:0.10,valor:opts.preco*0.10,dataPrevista:pr.assumptions.dataInicio,dataEfetiva:null,estado:'prevista'},
-              {id:Util.uid(),nome:'Meio da obra',percentagem:0.40,valor:opts.preco*0.40,dataPrevista:Util.addMonths(pr.assumptions.dataInicio,6),dataEfetiva:null,estado:'prevista'},
-              {id:Util.uid(),nome:'Escritura',percentagem:0.50,valor:opts.preco*0.50,dataPrevista:dataV,dataEfetiva:null,estado:'prevista'},
-            ]
+            dataVendaPrevista: opts.dataVenda, dataVendaEfetiva:null, observacoes:'', ignorarValidacao100:false,
+            pagamentos: opts.plano.map(pl=>({
+              id:Util.uid(), nome:pl.nome, percentagem:pl.percentagem, valor:pl.percentagem*opts.preco,
+              dataPrevista:pl.dataPrevista, dataEfetiva:null, estado:pl.estado
+            }))
           });
         }
         pr.meta.numMoradias = pr.houses.length;
       });
-      toast(opts.qtd+' casa(s) criada(s).');
+      toast(opts.qtd+' casa(s) criada(s), com plano de pagamentos aplicado.');
+    });
+    document.getElementById('btnApplyPlan').onclick = ()=> applyPaymentPlanModal(p.phases, ({faseId, plano})=>{
+      Store.update(pr=>{
+        pr.houses.forEach(h=>{
+          if(h.faseId!==faseId) return;
+          const preco = h.precoVendaEfetivo||h.precoVendaPrevisto||0;
+          h.pagamentos = plano.map(pl=>({
+            id:Util.uid(), nome:pl.nome, percentagem:pl.percentagem, valor:pl.percentagem*preco,
+            dataPrevista:pl.dataPrevista, dataEfetiva:null, estado:pl.estado
+          }));
+        });
+      });
+      toast('Plano de pagamentos aplicado às casas da fase.');
     });
     document.getElementById('btnManagePhases').onclick = ()=> phasesManagerModal(p, (phases)=>{
       Store.update(pr=>{
