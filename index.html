@@ -2251,6 +2251,7 @@ function phasesManagerModal(project, onSave){
   const phases = Util.deepClone(project.phases);
   openModal(`
     <h3>Gerir fases</h3>
+    <p style="color:var(--ink-soft);font-size:12px;">A data de venda de uma fase é aplicada, ao guardar, a todas as casas dessa fase (substitui a data prevista de venda de cada casa).</p>
     <div id="phaseRows"></div>
     <button class="icon-btn" id="addPhase">+ Adicionar fase</button>
     <div class="modal-foot"><button class="tb-btn" id="btnCancel">Cancelar</button><button class="tb-btn primary" id="btnSave">Guardar</button></div>
@@ -2258,18 +2259,20 @@ function phasesManagerModal(project, onSave){
     const wrap = modalEl.querySelector('#phaseRows');
     function paint(){
       wrap.innerHTML = phases.map((f,i)=>`
-        <div class="grid cols-4" style="margin-bottom:6px;">
-          <input class="f-nome" data-i="${i}" value="${Util.escapeHtml(f.nome)}" placeholder="Nome">
-          <input type="number" class="f-ini" data-i="${i}" value="${f.mesInicio}" placeholder="Mês início">
-          <input type="number" class="f-fim" data-i="${i}" value="${f.mesFim}" placeholder="Mês fim">
+        <div class="grid cols-5" style="margin-bottom:6px;align-items:end;">
+          <div class="field"><label>Nome</label><input class="f-nome" data-i="${i}" value="${Util.escapeHtml(f.nome)}" placeholder="Nome"></div>
+          <div class="field"><label>Mês início</label><input type="number" class="f-ini" data-i="${i}" value="${f.mesInicio}" placeholder="Mês início"></div>
+          <div class="field"><label>Mês fim</label><input type="number" class="f-fim" data-i="${i}" value="${f.mesFim}" placeholder="Mês fim"></div>
+          <div class="field"><label>Data de venda (aplica a todas as casas)</label><input type="date" class="f-data" data-i="${i}" value="${f.dataVendaPrevista||''}"></div>
           <button class="icon-btn danger" data-i="${i}" id="rmPhase">Remover</button>
         </div>`).join('');
       wrap.querySelectorAll('.f-nome').forEach(el=>el.onchange=()=>phases[+el.dataset.i].nome=el.value);
       wrap.querySelectorAll('.f-ini').forEach(el=>el.onchange=()=>phases[+el.dataset.i].mesInicio=+el.value);
       wrap.querySelectorAll('.f-fim').forEach(el=>el.onchange=()=>phases[+el.dataset.i].mesFim=+el.value);
+      wrap.querySelectorAll('.f-data').forEach(el=>el.onchange=()=>phases[+el.dataset.i].dataVendaPrevista=el.value);
       wrap.querySelectorAll('#rmPhase').forEach(btn=>btn.onclick=()=>{ phases.splice(+btn.dataset.i,1); paint(); });
     }
-    modalEl.querySelector('#addPhase').onclick=()=>{ phases.push({id:Util.uid(),nome:'Fase '+(phases.length+1),mesInicio:0,mesFim:6}); paint(); };
+    modalEl.querySelector('#addPhase').onclick=()=>{ phases.push({id:Util.uid(),nome:'Fase '+(phases.length+1),mesInicio:0,mesFim:6,dataVendaPrevista:''}); paint(); };
     paint();
     modalEl.closest('.modal-backdrop').querySelector('#btnCancel').onclick = closeModals;
     modalEl.closest('.modal-backdrop').querySelector('#btnSave').onclick = ()=>{ onSave(phases); closeModals(); };
@@ -2502,18 +2505,48 @@ function loanEditorModal(loan, onSave){
 /* =========================================================================
    VIEW: CASH-FLOW
    ========================================================================= */
+const CF_ENTRADA_LABELS = {
+  capitalSocial:'Capital social (investidores/promotor)', suprimentos:'Suprimentos (investidores/promotor)',
+  prestacoes:'Prestações acessórias', creditoBancario:'Crédito bancário (utilizações)',
+  cpcv:'Sinais de CPCV (vendas)', pagamentosIntermedios:'Pagamentos intermédios (vendas)',
+  escrituras:'Escrituras (vendas)', outrosProveitos:'Outros proveitos',
+  capitalProprioPromotor:'Capital próprio do promotor (automático, para cobrir défice de caixa)'
+};
+const CF_SAIDA_LABELS = {
+  custosTotaisArr:'Custos do projeto (aba Custos)', jurosFinanciamento:'Juros de financiamento',
+  comissoesFinanciamento:'Comissões de financiamento', amortizacaoDivida:'Amortização de dívida',
+  devolucaoCapitalSocial:'Devolução de capital social', devolucaoSuprimentos:'Devolução de suprimentos',
+  devolucaoPrestacoes:'Devolução de prestações acessórias', remuneracaoInvestidores:'Remuneração de investidores',
+  participacaoLucroInvestidores:'Participação nos lucros (investidores)', tributacao:'Tributação (IRC)',
+  distribuicaoPromotor:'Distribuição final ao promotor (automática, residual do projeto)'
+};
 function viewCashflow(p, cf){
   const labels = Array.from({length:cf.monthCount},(_,i)=>Util.monthLabel(cf.start,i));
+  function detailRows(i){
+    const ent = Object.keys(CF_ENTRADA_LABELS).map(k=>{
+      const arr = k==='capitalProprioPromotor' ? cf.led.capitalProprioPromotor : cf.led[k];
+      return {label:CF_ENTRADA_LABELS[k], v:(arr&&arr[i])||0};
+    }).filter(x=>Math.abs(x.v)>0.005);
+    const sai = Object.keys(CF_SAIDA_LABELS).map(k=>{
+      const arr = k==='custosTotaisArr' ? cf.custosTotaisArr : (k==='distribuicaoPromotor' ? cf.led.distribuicaoPromotor : cf.led[k]);
+      return {label:CF_SAIDA_LABELS[k], v:(arr&&arr[i])||0};
+    }).filter(x=>Math.abs(x.v)>0.005);
+    return `<div class="grid cols-2" style="gap:14px;">
+      <div><div class="section-sub">Origem das entradas</div>${ent.length?ent.map(x=>`<div style="display:flex;justify-content:space-between;padding:3px 0;font-size:12.5px;"><span>${Util.escapeHtml(x.label)}</span><span class="mono">${Util.fmtMoney0(x.v)}</span></div>`).join(''):'<div class="empty">Sem entradas este mês.</div>'}</div>
+      <div><div class="section-sub">Destino das saídas</div>${sai.length?sai.map(x=>`<div style="display:flex;justify-content:space-between;padding:3px 0;font-size:12.5px;"><span>${Util.escapeHtml(x.label)}</span><span class="mono">${Util.fmtMoney0(x.v)}</span></div>`).join(''):'<div class="empty">Sem saídas este mês.</div>'}</div>
+    </div>`;
+  }
   const rows = labels.map((lab,i)=>`
-    <tr>
-      <td>${lab}</td>
+    <tr class="cf-row" data-mi="${i}" style="cursor:pointer;">
+      <td>▸ ${lab}</td>
       <td class="num mono">${Util.fmtMoney0(cf.entradas[i])}</td>
       <td class="num mono">${Util.fmtMoney0(cf.saidas[i])}</td>
       <td class="num mono ${cf.cfLiquido[i]<0?'':''}" style="${cf.cfLiquido[i]<0?'color:var(--neg)':''}">${Util.fmtMoney0(cf.cfLiquido[i])}</td>
       <td class="num mono" style="${cf.cfAcumulado[i]<0?'color:var(--neg);font-weight:600':''}">${Util.fmtMoney0(cf.cfAcumulado[i])}</td>
-    </tr>`).join('');
+    </tr>
+    <tr class="cf-detail-row" data-mi-detail="${i}" style="display:none;"><td colspan="5" style="background:var(--surface-alt);">${detailRows(i)}</td></tr>`).join('');
   return `
-  <div class="view-head"><div><h2>Cash-Flow Mensal</h2><p>Linha temporal completa do projeto, do primeiro ao último mês com movimento. Inclui automaticamente as entradas de capital próprio do promotor necessárias para o saldo nunca ficar negativo, e a distribuição final desse residual. Cenário: <strong>${Store.getScenario()}</strong>.</p></div></div>
+  <div class="view-head"><div><h2>Cash-Flow Mensal</h2><p>Linha temporal completa do projeto, do primeiro ao último mês com movimento. Inclui automaticamente as entradas de capital próprio do promotor necessárias para o saldo nunca ficar negativo, e a distribuição final desse residual. Clica numa linha da tabela para ver o detalhe do mês. Cenário: <strong>${Store.getScenario()}</strong>.</p></div></div>
   <div class="kpis">
     <div class="kpi"><div class="k-label">Necessidade de capital sem financiamento</div><div class="k-value neg">${Util.fmtMoney0(cf.capitalNecessario)}</div><div class="k-sub">pior défice antes de investidores/banco — mês ${Util.monthLabel(cf.start,cf.mesPiorCapital)}</div></div>
     <div class="kpi"><div class="k-label">Capital próprio do promotor necessário</div><div class="k-value neg">${Util.fmtMoney0(cf.capitalProprioPromotorTotal)}</div><div class="k-sub">com a estrutura de investidores/banco atual</div></div>
@@ -2921,7 +2954,18 @@ function wireView(view, p, cf){
       });
       toast(opts.qtd+' casa(s) criada(s).');
     });
-    document.getElementById('btnManagePhases').onclick = ()=> phasesManagerModal(p, (phases)=>{ Store.update(pr=> pr.phases=phases); toast('Fases atualizadas.'); });
+    document.getElementById('btnManagePhases').onclick = ()=> phasesManagerModal(p, (phases)=>{
+      Store.update(pr=>{
+        pr.phases = phases;
+        // Aplica a data de venda de cada fase a todas as casas dessa fase.
+        phases.forEach(f=>{
+          if(f.dataVendaPrevista){
+            pr.houses.forEach(h=>{ if(h.faseId===f.id) h.dataVendaPrevista = f.dataVendaPrevista; });
+          }
+        });
+      });
+      toast('Fases atualizadas.');
+    });
     document.querySelectorAll('#content tbody tr[data-id]').forEach(tr=>{
       const id = tr.dataset.id;
       tr.querySelector('[data-act="edit"]').onclick = ()=>{
@@ -2995,6 +3039,16 @@ function wireView(view, p, cf){
     });
   }
   if(view==='cashflow'){
+    document.querySelectorAll('#content tr.cf-row').forEach(tr=>{
+      tr.onclick = ()=>{
+        const mi = tr.dataset.mi;
+        const detail = document.querySelector(`#content tr.cf-detail-row[data-mi-detail="${mi}"]`);
+        if(!detail) return;
+        const open = detail.style.display !== 'none';
+        detail.style.display = open ? 'none' : 'table-row';
+        tr.querySelector('td').textContent = (open?'▸ ':'▾ ') + tr.querySelector('td').textContent.replace(/^[▸▾]\s*/,'');
+      };
+    });
     const labels = Array.from({length:cf.monthCount},(_,i)=>Util.monthLabel(cf.start,i));
     UI.charts.cf = new Chart(document.getElementById('chartCF'), {
       type:'bar',
