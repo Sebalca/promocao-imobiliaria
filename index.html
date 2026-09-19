@@ -1202,18 +1202,17 @@ const CashFlowEngine = (function(){
     opAcum.forEach((v,i)=>{ if(v<piorValor){ piorValor=v; piorMes=i; } });
     const capitalNecessario = -piorValor;
 
-    // CAPITAL PRÓPRIO DO PROMOTOR — calculado como o residual que tem de entrar, mês a mês,
-    // depois de contabilizadas as entradas já configuradas de investidores e banco, para nunca
-    // deixar o saldo acumulado do projeto ficar negativo. O saldo final acumulado (depois de
-    // pagas todas as obrigações a investidores/banco/fisco) é o montante distribuível ao promotor
-    // no final do projeto — devolução do seu capital + lucro residual.
+    // Sem injeção automática de capital do promotor para cobrir défice de caixa: o saldo
+    // acumulado reflete apenas o que foi realmente introduzido (custos, vendas, financiamento,
+    // investidores) e pode ficar negativo se o projeto estiver, nesse momento, por financiar.
+    // No final, se sobrar saldo positivo (depois de pagas todas as obrigações a
+    // investidores/banco/fisco), esse residual é distribuído ao promotor.
     // No modo waterfall, esta primeira passagem exclui as devoluções/remunerações de investidores
     // (ainda todas a zero nos arrays led), pois estas só são conhecidas depois de repartido o pool.
     const capitalProprioPromotor = zeros();
     let runP = 0;
     for(let m=0;m<monthCount;m++){
       runP += cfLiquidoBase[m];
-      if(runP < -0.005){ capitalProprioPromotor[m] = -runP; runP = 0; }
     }
     let promoterFinalDistribution = Math.max(0, runP);
     const distribuicaoPromotor = zeros();
@@ -1504,7 +1503,7 @@ const ReportEngine = (function(){
       y = addTitledTable(doc, y, 'Indicadores Financeiros', ['Indicador','Valor'], [
         ['TIR do promotor (anualizada)', irr.value!==null?Util.fmtPct(MetricsEngine.annualize(irr.value)):'Sem TIR válida'],
         ['VAL (capital próprio do promotor)', Util.fmtMoney0(val)],
-        ['Capital próprio do promotor necessário', Util.fmtMoney0(cf.capitalProprioPromotorTotal)],
+        ['Pior saldo acumulado (não financiado)', Util.fmtMoney0(Math.min(...cf.cfAcumulado))],
         ['Distribuição final ao promotor', Util.fmtMoney0(cf.promoterFinalDistribution)],
         ['Resultado líquido estimado', Util.fmtMoney0(cf.resultadoLiquido)],
       ]);
@@ -2509,31 +2508,34 @@ const CF_ENTRADA_LABELS = {
   capitalSocial:'Capital social (investidores/promotor)', suprimentos:'Suprimentos (investidores/promotor)',
   prestacoes:'Prestações acessórias', creditoBancario:'Crédito bancário (utilizações)',
   cpcv:'Sinais de CPCV (vendas)', pagamentosIntermedios:'Pagamentos intermédios (vendas)',
-  escrituras:'Escrituras (vendas)', outrosProveitos:'Outros proveitos',
-  capitalProprioPromotor:'Capital próprio do promotor (automático, para cobrir défice de caixa)'
+  escrituras:'Escrituras (vendas)', outrosProveitos:'Outros proveitos'
 };
 const CF_SAIDA_LABELS = {
-  custosTotaisArr:'Custos do projeto (aba Custos)', jurosFinanciamento:'Juros de financiamento',
+  jurosFinanciamento:'Juros de financiamento',
   comissoesFinanciamento:'Comissões de financiamento', amortizacaoDivida:'Amortização de dívida',
   devolucaoCapitalSocial:'Devolução de capital social', devolucaoSuprimentos:'Devolução de suprimentos',
   devolucaoPrestacoes:'Devolução de prestações acessórias', remuneracaoInvestidores:'Remuneração de investidores',
   participacaoLucroInvestidores:'Participação nos lucros (investidores)', tributacao:'Tributação (IRC)',
-  distribuicaoPromotor:'Distribuição final ao promotor (automática, residual do projeto)'
+  distribuicaoPromotor:'Distribuição final ao promotor (residual do projeto, se positivo)'
 };
 function viewCashflow(p, cf){
   const labels = Array.from({length:cf.monthCount},(_,i)=>Util.monthLabel(cf.start,i));
   function detailRows(i){
     const ent = Object.keys(CF_ENTRADA_LABELS).map(k=>{
-      const arr = k==='capitalProprioPromotor' ? cf.led.capitalProprioPromotor : cf.led[k];
+      const arr = cf.led[k];
       return {label:CF_ENTRADA_LABELS[k], v:(arr&&arr[i])||0};
     }).filter(x=>Math.abs(x.v)>0.005);
-    const sai = Object.keys(CF_SAIDA_LABELS).map(k=>{
-      const arr = k==='custosTotaisArr' ? cf.custosTotaisArr : (k==='distribuicaoPromotor' ? cf.led.distribuicaoPromotor : cf.led[k]);
+    const custosDetail = Object.keys(cf.led.custosPorCategoria).map(k=>({
+      label:'Custo — '+k, v:(cf.led.custosPorCategoria[k]&&cf.led.custosPorCategoria[k][i])||0
+    })).filter(x=>Math.abs(x.v)>0.005);
+    const outrasSaidas = Object.keys(CF_SAIDA_LABELS).map(k=>{
+      const arr = k==='distribuicaoPromotor' ? cf.led.distribuicaoPromotor : cf.led[k];
       return {label:CF_SAIDA_LABELS[k], v:(arr&&arr[i])||0};
     }).filter(x=>Math.abs(x.v)>0.005);
+    const sai = [...custosDetail, ...outrasSaidas];
     return `<div class="grid cols-2" style="gap:14px;">
       <div><div class="section-sub">Origem das entradas</div>${ent.length?ent.map(x=>`<div style="display:flex;justify-content:space-between;padding:3px 0;font-size:12.5px;"><span>${Util.escapeHtml(x.label)}</span><span class="mono">${Util.fmtMoney0(x.v)}</span></div>`).join(''):'<div class="empty">Sem entradas este mês.</div>'}</div>
-      <div><div class="section-sub">Destino das saídas</div>${sai.length?sai.map(x=>`<div style="display:flex;justify-content:space-between;padding:3px 0;font-size:12.5px;"><span>${Util.escapeHtml(x.label)}</span><span class="mono">${Util.fmtMoney0(x.v)}</span></div>`).join(''):'<div class="empty">Sem saídas este mês.</div>'}</div>
+      <div><div class="section-sub">Destino das saídas (custos discriminados por categoria)</div>${sai.length?sai.map(x=>`<div style="display:flex;justify-content:space-between;padding:3px 0;font-size:12.5px;"><span>${Util.escapeHtml(x.label)}</span><span class="mono">${Util.fmtMoney0(x.v)}</span></div>`).join(''):'<div class="empty">Sem saídas este mês.</div>'}</div>
     </div>`;
   }
   const rows = labels.map((lab,i)=>`
@@ -2546,11 +2548,11 @@ function viewCashflow(p, cf){
     </tr>
     <tr class="cf-detail-row" data-mi-detail="${i}" style="display:none;"><td colspan="5" style="background:var(--surface-alt);">${detailRows(i)}</td></tr>`).join('');
   return `
-  <div class="view-head"><div><h2>Cash-Flow Mensal</h2><p>Linha temporal completa do projeto, do primeiro ao último mês com movimento. Inclui automaticamente as entradas de capital próprio do promotor necessárias para o saldo nunca ficar negativo, e a distribuição final desse residual. Clica numa linha da tabela para ver o detalhe do mês. Cenário: <strong>${Store.getScenario()}</strong>.</p></div></div>
+  <div class="view-head"><div><h2>Cash-Flow Mensal</h2><p>Linha temporal completa do projeto, do primeiro ao último mês com movimento, apenas com o que foi introduzido (custos, vendas, financiamento, investidores) — o saldo pode ficar negativo se o projeto estiver, nesse momento, por financiar. No final, se sobrar saldo positivo, é distribuído ao promotor. Clica numa linha da tabela para ver o detalhe do mês. Cenário: <strong>${Store.getScenario()}</strong>.</p></div></div>
   <div class="kpis">
     <div class="kpi"><div class="k-label">Necessidade de capital sem financiamento</div><div class="k-value neg">${Util.fmtMoney0(cf.capitalNecessario)}</div><div class="k-sub">pior défice antes de investidores/banco — mês ${Util.monthLabel(cf.start,cf.mesPiorCapital)}</div></div>
-    <div class="kpi"><div class="k-label">Capital próprio do promotor necessário</div><div class="k-value neg">${Util.fmtMoney0(cf.capitalProprioPromotorTotal)}</div><div class="k-sub">com a estrutura de investidores/banco atual</div></div>
-    <div class="kpi"><div class="k-label">Cash-flow acumulado final</div><div class="k-value ${cf.cfAcumulado[cf.cfAcumulado.length-1]<-1?'neg':'pos'}">${Util.fmtMoney0(cf.cfAcumulado[cf.cfAcumulado.length-1])}</div><div class="k-sub">deve ser ≈0 (tudo distribuído)</div></div>
+    <div class="kpi"><div class="k-label">Pior saldo acumulado</div><div class="k-value ${Math.min(...cf.cfAcumulado)<-1?'neg':'pos'}">${Util.fmtMoney0(Math.min(...cf.cfAcumulado))}</div><div class="k-sub">com a estrutura de investidores/banco atual — mês ${Util.monthLabel(cf.start, cf.cfAcumulado.indexOf(Math.min(...cf.cfAcumulado)))}</div></div>
+    <div class="kpi"><div class="k-label">Cash-flow acumulado final</div><div class="k-value ${cf.cfAcumulado[cf.cfAcumulado.length-1]<-1?'neg':'pos'}">${Util.fmtMoney0(cf.cfAcumulado[cf.cfAcumulado.length-1])}</div><div class="k-sub">≈0 se tudo distribuído; negativo indica projeto por financiar</div></div>
     <div class="kpi"><div class="k-label">Duração modelada</div><div class="k-value">${cf.monthCount} meses</div></div>
   </div>
   <div class="card"><h3>Cash-flow mensal e acumulado</h3><div class="chart-box"><canvas id="chartCF"></canvas></div></div>
@@ -2635,7 +2637,7 @@ function viewPromotor(p, cf){
     <div class="kpi"><div class="k-label">Resultado antes de impostos</div><div class="k-value">${Util.fmtMoney0(cf.resultadoFinalAntesImpostos)}</div></div>
     <div class="kpi"><div class="k-label">Tributação estimada</div><div class="k-value">${Util.fmtMoney0(cf.tributacaoTotal)}</div></div>
     <div class="kpi"><div class="k-label">Resultado líquido estimado</div><div class="k-value ${cf.resultadoLiquido<0?'neg':'pos'}">${Util.fmtMoney0(cf.resultadoLiquido)}</div></div>
-    <div class="kpi"><div class="k-label">Capital próprio do promotor</div><div class="k-value neg">${Util.fmtMoney0(cf.capitalProprioPromotorTotal)}</div><div class="k-sub">capital que o promotor tem de injetar</div></div>
+    <div class="kpi"><div class="k-label">Pior saldo acumulado (não financiado)</div><div class="k-value ${Math.min(...cf.cfAcumulado)<-1?'neg':'pos'}">${Util.fmtMoney0(Math.min(...cf.cfAcumulado))}</div><div class="k-sub">défice de caixa que ficaria por cobrir, sem capital do promotor</div></div>
     <div class="kpi"><div class="k-label">Capital de investidores</div><div class="k-value">${Util.fmtMoney0(cf.totalCapitalInvestidores)}</div></div>
     <div class="kpi"><div class="k-label">Dívida bancária</div><div class="k-value">${Util.fmtMoney0(cf.totalFinanciamentoBancario)}</div></div>
     <div class="kpi"><div class="k-label">Distribuição final ao promotor</div><div class="k-value pos">${Util.fmtMoney0(cf.promoterFinalDistribution)}</div><div class="k-sub">capital devolvido + lucro residual</div></div>
