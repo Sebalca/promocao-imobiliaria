@@ -2176,6 +2176,7 @@ function viewCustos(p, cf){
   const totalCash = Util.sum(cf.costBreakdown, x=>x.cashOut);
   const totalEcon = Util.sum(cf.costBreakdown, x=>x.economico);
   const itemsOriginal = allProjectCosts(p);
+  const totalVenda = Util.sum(itemsOriginal, c=>c.valorVenda||0);
   const cashOutOf = c=> (cf.costBreakdown.find(b=>b.id===c.id)||{cashOut:0}).cashOut;
   const items = applyTableSort('custos', itemsOriginal, {
     aba: c=>c.origem||'', categoria: c=>c.categoria||'', subcategoria: c=>c.subcategoria||'', descricao: c=>c.descricao||'',
@@ -2203,6 +2204,7 @@ function viewCustos(p, cf){
   return `
   <div class="view-head"><div><h2>Custos</h2><p>Lista consolidada de todos os custos do projeto — junta as rubricas de "Custos construção" e "Custos outros", que são as abas onde se adicionam, editam ou eliminam custos. Esta aba é só de consulta. Clica num cabeçalho de coluna para ordenar.</p></div></div>
   <div class="kpis">
+    <div class="kpi"><div class="k-label">Valor total${kpiInfo('Somatório do valor de venda de todas as rubricas de custo (Custos construção + Custos outros). Fórmula: Σ valor de venda de cada rubrica.')}</div><div class="k-value">${Util.fmtMoney0(totalVenda)}</div></div>
     <div class="kpi"><div class="k-label">Custo total (cash-out)</div><div class="k-value">${Util.fmtMoney0(totalCash)}</div></div>
     <div class="kpi"><div class="k-label">Custo económico total</div><div class="k-value">${Util.fmtMoney0(totalEcon)}</div><div class="k-sub">exclui IVA dedutível</div></div>
     <div class="kpi"><div class="k-label">Nº de rubricas</div><div class="k-value">${items.length}</div></div>
