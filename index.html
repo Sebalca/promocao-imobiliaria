@@ -3180,10 +3180,46 @@ const CF_SAIDA_LABELS = {
   participacaoLucroInvestidores:'Participação nos lucros (investidores)', tributacao:'Tributação (IRC)',
   distribuicaoPromotor:'Distribuição final ao promotor (residual do projeto, se positivo)'
 };
+// Entradas de dinheiro discriminadas pela sua origem real — capital social, suprimentos
+// e prestações por investidor; CPCV, pagamentos intermédios e escrituras por fase da casa —
+// com a data EXATA de cada movimento (não reconstituída a partir do índice do mês, que só
+// tem granularidade mensal e por isso "arredondava" sempre ao dia 1 do mês).
+const GRANULAR_ENTRADA_KEYS = ['capitalSocial','suprimentos','prestacoes','cpcv','pagamentosIntermedios','escrituras'];
+const TIPO_CONTRIB_LABELS = {capital_social:'Capital social', suprimentos:'Suprimentos', prestacoes:'Prestações acessórias'};
+function buildGranularEntradas(p){
+  const out = [];
+  (p.investors||[]).forEach(inv=>{
+    (inv.contributions||[]).forEach(c=>{
+      const dataEfetiva = investorEffectiveContribDate(p, inv, c.data);
+      if(!dataEfetiva || !(c.valor)) return;
+      out.push({data:dataEfetiva, tipo:'entrada', v:c.valor||0, label:`${TIPO_CONTRIB_LABELS[c.tipo]||c.tipo} - ${inv.nome}`});
+    });
+  });
+  (p.houses||[]).forEach(h=>{
+    const fase = (p.phases||[]).find(f=>f.id===h.faseId);
+    const faseNome = fase ? fase.nome : 'Sem fase';
+    (h.pagamentos||[]).forEach(pay=>{
+      const dataRef = pay.dataEfetiva||pay.dataPrevista;
+      if(!dataRef) return;
+      const valor = (pay.valor!==undefined&&pay.valor!==null)?pay.valor:(pay.percentagem||0)*(h.precoVendaEfetivo||h.precoVendaPrevisto||0);
+      if(!valor) return;
+      const nomeLower = (pay.nome||'').toLowerCase();
+      const tipoLabel = nomeLower.includes('cpcv') ? 'CPCV' : nomeLower.includes('escrit') ? 'Escritura' : 'Pagamento intermédio';
+      out.push({data:dataRef, tipo:'entrada', v:valor, label:`${tipoLabel} - ${faseNome}`});
+    });
+  });
+  return out;
+}
 // Devolve os movimentos (entradas/saídas discriminadas) de um mês do cash-flow —
 // usado tanto no detalhe expansível da vista "Geral" como na vista "Flow necessidades".
-function cfMonthMovements(cf, i){
-  const ent = Object.keys(CF_ENTRADA_LABELS).map(k=>{
+// Capital social/suprimentos/prestações e CPCV/pagamentos intermédios/escrituras vêm
+// discriminados por investidor/fase (buildGranularEntradas); as restantes entradas e
+// todas as saídas continuam agregadas por categoria, como antes.
+function cfMonthMovements(p, cf, i){
+  const entGranular = buildGranularEntradas(p)
+    .filter(x=> Util.clamp(Util.monthIndex(x.data, cf.start),0,cf.monthCount-1)===i)
+    .filter(x=>Math.abs(x.v)>0.005);
+  const entAgregado = Object.keys(CF_ENTRADA_LABELS).filter(k=>!GRANULAR_ENTRADA_KEYS.includes(k)).map(k=>{
     const arr = cf.led[k];
     return {label:CF_ENTRADA_LABELS[k], v:(arr&&arr[i])||0, tipo:'entrada'};
   }).filter(x=>Math.abs(x.v)>0.005);
@@ -3194,7 +3230,7 @@ function cfMonthMovements(cf, i){
     const arr = k==='distribuicaoPromotor' ? cf.led.distribuicaoPromotor : cf.led[k];
     return {label:CF_SAIDA_LABELS[k], v:(arr&&arr[i])||0, tipo:'saida'};
   }).filter(x=>Math.abs(x.v)>0.005);
-  return [...ent, ...custosDetail, ...outrasSaidas];
+  return [...entGranular, ...entAgregado, ...custosDetail, ...outrasSaidas];
 }
 function cashflowSubTabs(){
   const sv = UI.cashflowSubView||'geral';
@@ -3213,7 +3249,7 @@ function viewCashflow(p, cf){
   if((UI.cashflowSubView||'geral')==='necessidades') return viewCashflowNecessidades(p, cf);
   const labels = Array.from({length:cf.monthCount},(_,i)=>Util.monthLabel(cf.start,i));
   function detailRows(i){
-    const mv = cfMonthMovements(cf, i);
+    const mv = cfMonthMovements(p, cf, i);
     const ent = mv.filter(x=>x.tipo==='entrada');
     const sai = mv.filter(x=>x.tipo==='saida');
     return `<div class="grid cols-2" style="gap:14px;">
@@ -3250,10 +3286,27 @@ function viewCashflow(p, cf){
 // (entrada OU saída), com saldo acumulado linha a linha (estilo folha de cálculo).
 function viewCashflowNecessidades(p, cf){
   const linhas = [];
+  // Entradas discriminadas por investidor/fase, com a data exata de cada movimento.
+  buildGranularEntradas(p).forEach(x=> linhas.push(x));
+  // Restantes entradas (crédito bancário, outros proveitos) e todas as saídas, por mês
+  // (sem discriminação individual — a fonte destes valores só tem granularidade mensal).
   for(let i=0;i<cf.monthCount;i++){
     const dt = Util.addMonths(cf.start, i);
-    cfMonthMovements(cf, i).forEach(mv=> linhas.push({data:dt, ...mv}));
+    Object.keys(CF_ENTRADA_LABELS).filter(k=>!GRANULAR_ENTRADA_KEYS.includes(k)).forEach(k=>{
+      const v = (cf.led[k]&&cf.led[k][i])||0;
+      if(Math.abs(v)>0.005) linhas.push({data:dt, tipo:'entrada', v, label:CF_ENTRADA_LABELS[k]});
+    });
+    Object.keys(cf.led.custosPorCategoria).forEach(k=>{
+      const v = (cf.led.custosPorCategoria[k]&&cf.led.custosPorCategoria[k][i])||0;
+      if(Math.abs(v)>0.005) linhas.push({data:dt, tipo:'saida', v, label:'Custo — '+k});
+    });
+    Object.keys(CF_SAIDA_LABELS).forEach(k=>{
+      const arr = k==='distribuicaoPromotor' ? cf.led.distribuicaoPromotor : cf.led[k];
+      const v = (arr&&arr[i])||0;
+      if(Math.abs(v)>0.005) linhas.push({data:dt, tipo:'saida', v, label:CF_SAIDA_LABELS[k]});
+    });
   }
+  linhas.sort((a,b)=> a.data<b.data?-1:(a.data>b.data?1:0));
   let saldo = 0;
   const rowsHtml = linhas.map(r=>{
     saldo += (r.tipo==='entrada' ? r.v : -r.v);
