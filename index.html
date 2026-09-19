@@ -873,10 +873,38 @@ const ConstructionEngine = (function(){
 // outros" (cada rubrica passa a contar como custo do projeto pelo seu "valor de venda",
 // que guarda o valor total da rubrica; "valor de construção/compra" é só para a margem
 // nas abas de Análise). Usado pelo Cash-Flow, validações e pela aba "Custos" (consolidada).
-function allProjectCosts(project){
-  const fromConstrucao = (project.construcaoCustos||[]).map(c=>({...c, valorBase:c.valorVenda||0, origem:'construcao'}));
-  const fromOutros = (project.custosOutros||[]).map(c=>({...c, valorBase:c.valorVenda||0, origem:'outros'}));
+// basis: 'venda' (por defeito, usa o valor de venda como custo — comportamento normal
+// do cash-flow) ou 'custo' (usa o valor de construção/compra em vez do valor de venda,
+// para simular o cash-flow pelo lado do custo real de obra/compra).
+function allProjectCosts(project, basis){
+  const useCusto = basis==='custo';
+  const fromConstrucao = (project.construcaoCustos||[]).map(c=>({...c, valorBase: useCusto ? (c.valorConstrucao||c.valorVenda||0) : (c.valorVenda||0), origem:'construcao'}));
+  const fromOutros = (project.custosOutros||[]).map(c=>({...c, valorBase: useCusto ? (c.valorCompra||c.valorVenda||0) : (c.valorVenda||0), origem:'outros'}));
   return [...fromConstrucao, ...fromOutros];
+}
+
+// Data em que o capital de um investidor é necessário: escolhe-se uma categoria de custo
+// e um nº de dias de antecedência; a data-necessidade = data de início dessa categoria
+// (o mês mais cedo entre as rubricas dessa categoria) menos esse nº de dias. Devolve null
+// se o investidor não tiver categoria definida ou não houver rubricas dessa categoria.
+function computeDataNecessidade(project, investor){
+  if(!investor || !investor.categoriaNecessidade) return null;
+  const items = allProjectCosts(project).filter(c=>c.categoria===investor.categoriaNecessidade);
+  if(!items.length) return null;
+  const minMes = Math.min(...items.map(c=>c.mesInicio||0));
+  const dataCategoria = Util.addMonths(project.assumptions.dataInicio, minMes);
+  const dias = investor.diasNecessidade||0;
+  const d = new Date(dataCategoria+'T00:00:00');
+  d.setDate(d.getDate()-dias);
+  return d.toISOString().slice(0,10);
+}
+// Data efetiva a usar no cash-flow para as entradas de capital de um investidor: se tiver
+// uma categoria de necessidade definida, todas as suas entradas de capital são tratadas
+// como acontecendo nessa data (o dinheiro entra mesmo quando é precisado); caso contrário,
+// usa-se a data configurada em cada entrada de capital.
+function investorEffectiveContribDate(project, investor, contribData){
+  const dn = computeDataNecessidade(project, investor);
+  return dn || contribData;
 }
 
 /* =========================================================================
@@ -954,19 +982,23 @@ const FinancingEngine = (function(){
    INVESTOR ENGINE
    ========================================================================= */
 const InvestorEngine = (function(){
-  function contributionsByMonth(investor, startIso, monthCount){
+  // project (opcional): quando o investidor tem uma "categoria de necessidade" definida,
+  // todas as suas entradas de capital passam a contar na data-necessidade calculada a
+  // partir dessa categoria, em vez das datas configuradas em cada entrada.
+  function contributionsByMonth(investor, startIso, monthCount, project){
     const arr = new Array(monthCount).fill(0);
     const byTipo = {capital_social:0, suprimentos:0, prestacoes:0};
     (investor.contributions||[]).forEach(c=>{
-      const idx = Util.clamp(Util.monthIndex(c.data, startIso),0,monthCount-1);
+      const dataEfetiva = project ? investorEffectiveContribDate(project, investor, c.data) : c.data;
+      const idx = Util.clamp(Util.monthIndex(dataEfetiva, startIso),0,monthCount-1);
       arr[idx]+= c.valor||0;
       byTipo[c.tipo] = (byTipo[c.tipo]||0)+(c.valor||0);
     });
     return {arr, byTipo, total: byTipo.capital_social+byTipo.suprimentos+byTipo.prestacoes};
   }
   // Compute distribution events for an investor, given resolved project profit (may be null on pass 1)
-  function computeDistributions(investor, startIso, monthCount, projectProfitBeforeParticipation){
-    const cap = contributionsByMonth(investor, startIso, monthCount);
+  function computeDistributions(investor, startIso, monthCount, projectProfitBeforeParticipation, project){
+    const cap = contributionsByMonth(investor, startIso, monthCount, project);
     const events = []; // {mes, tipo, valor}
     const rm = investor.returnModel||{tipo:'fixo'};
     const entradaIdx = Util.clamp(Util.monthIndex(investor.dataEntrada, startIso),0,monthCount-1);
@@ -1027,8 +1059,8 @@ const InvestorEngine = (function(){
   }
   // Calcula a "procura" de cada investidor por categoria de tier de waterfall (sem aplicar pushCapitalReturn diretamente),
   // usada pelo WaterfallEngine para montar os totais por prioridade.
-  function computeWaterfallDemand(investor, startIso, monthCount, projectProfitBeforeParticipation){
-    const cap = contributionsByMonth(investor, startIso, monthCount);
+  function computeWaterfallDemand(investor, startIso, monthCount, projectProfitBeforeParticipation, project){
+    const cap = contributionsByMonth(investor, startIso, monthCount, project);
     const rm = investor.returnModel||{tipo:'fixo'};
     const entradaIdx = Util.clamp(Util.monthIndex(investor.dataEntrada, startIso),0,monthCount-1);
     let exitIdx = investor.dataSaidaPrevista ? Util.clamp(Util.monthIndex(investor.dataSaidaPrevista, startIso),0,monthCount-1) : monthCount-1;
@@ -1076,7 +1108,7 @@ const InvestorEngine = (function(){
 const WaterfallEngine = (function(){
   function allocate(project, startIso, monthCount, pool, resultadoAntesParticipacao){
     const ordem = (project.waterfall && project.waterfall.ordem) || ['suprimentos','preferencial','capital','lucro','residual'];
-    const demands = project.investors.map(inv=> ({ inv, d: InvestorEngine.computeWaterfallDemand(inv, startIso, monthCount, resultadoAntesParticipacao) }));
+    const demands = project.investors.map(inv=> ({ inv, d: InvestorEngine.computeWaterfallDemand(inv, startIso, monthCount, resultadoAntesParticipacao, project) }));
     let remaining = pool;
     const alloc = {}; // invId -> {suprimentos,capital,preferencial,lucro}
     demands.forEach(({inv})=> alloc[inv.id] = {suprimentos:0, capital:0, preferencial:0, lucro:0});
@@ -1151,7 +1183,7 @@ const CashFlowEngine = (function(){
   }
 
   // full: builds the complete monthly ledger. excludeInvestorReturns: for pass-1 profit calc.
-  function build(project, scenarioKey, excludeInvestorReturns){
+  function build(project, scenarioKey, excludeInvestorReturns, basis){
     const {proj, deltas} = ScenarioEngine.apply(project, scenarioKey);
     const start = proj.assumptions.dataInicio;
     const monthCount = computeMonthCount(proj);
@@ -1170,8 +1202,9 @@ const CashFlowEngine = (function(){
     };
     const costBreakdown = []; // {id, categoria, descricao, cashOut, economico, ivaSuportado, ivaDedutivel}
 
-    // custos (consolidados de "Custos construção" + "Custos outros")
-    allProjectCosts(proj).forEach(cost=>{
+    // custos (consolidados de "Custos construção" + "Custos outros") — basis 'venda'
+    // (por defeito) ou 'custo', conforme escolhido na aba Cash-Flow.
+    allProjectCosts(proj, basis).forEach(cost=>{
       const dist = CostEngine.distributeCost(cost, start, monthCount);
       if(!led.custosPorCategoria[cost.categoria]) led.custosPorCategoria[cost.categoria]=zeros();
       if(!led.custosEconomicoPorCategoria[cost.categoria]) led.custosEconomicoPorCategoria[cost.categoria]=zeros();
@@ -1221,12 +1254,13 @@ const CashFlowEngine = (function(){
     // investidores — contribuições sempre entram
     const investorContribBreakdown = [];
     proj.investors.forEach(inv=>{
-      const c = InvestorEngine.contributionsByMonth(inv, start, monthCount);
+      const c = InvestorEngine.contributionsByMonth(inv, start, monthCount, proj);
       for(let m=0;m<monthCount;m++){
         // allocate proportionally by type per month isn't tracked per month by type here; approximate via totals below
       }
       (inv.contributions||[]).forEach(cc=>{
-        const idx = Util.clamp(Util.monthIndex(cc.data,start),0,monthCount-1);
+        const dataEfetiva = investorEffectiveContribDate(proj, inv, cc.data);
+        const idx = Util.clamp(Util.monthIndex(dataEfetiva,start),0,monthCount-1);
         if(cc.tipo==='capital_social') led.capitalSocial[idx]+=cc.valor||0;
         else if(cc.tipo==='suprimentos') led.suprimentos[idx]+=cc.valor||0;
         else if(cc.tipo==='prestacoes') led.prestacoes[idx]+=cc.valor||0;
@@ -1249,7 +1283,7 @@ const CashFlowEngine = (function(){
     if(!waterfallOn){
       // investidores — devoluções e remuneração (pass 2, usa resultadoAntesParticipacao quando aplicável)
       proj.investors.forEach(inv=>{
-        const events = InvestorEngine.computeDistributions(inv, start, monthCount, excludeInvestorReturns?null:resultadoAntesParticipacao);
+        const events = InvestorEngine.computeDistributions(inv, start, monthCount, excludeInvestorReturns?null:resultadoAntesParticipacao, proj);
         let totCapital=0, totRemun=0, totPart=0;
         events.forEach(ev=>{
           if(excludeInvestorReturns) return;
@@ -1270,7 +1304,7 @@ const CashFlowEngine = (function(){
     let nominalRemuneracaoTotal = 0, nominalParticipacaoTotal = 0;
     if(waterfallOn){
       proj.investors.forEach(inv=>{
-        const d = InvestorEngine.computeWaterfallDemand(inv, start, monthCount, excludeInvestorReturns?null:resultadoAntesParticipacao);
+        const d = InvestorEngine.computeWaterfallDemand(inv, start, monthCount, excludeInvestorReturns?null:resultadoAntesParticipacao, proj);
         nominalRemuneracaoTotal += d.preferencial;
         nominalParticipacaoTotal += d.lucro;
       });
@@ -1340,7 +1374,7 @@ const CashFlowEngine = (function(){
       });
       promoterFinalDistribution = wf.promoterResidual;
       const totalDemand = Util.sum(proj.investors, inv=>{
-        const d = InvestorEngine.computeWaterfallDemand(inv, start, monthCount, resultadoAntesParticipacao);
+        const d = InvestorEngine.computeWaterfallDemand(inv, start, monthCount, resultadoAntesParticipacao, proj);
         return d.suprimentos+d.capital+d.preferencial+d.lucro;
       });
       waterfallInfo = { pool: poolFinal, totalDemand, promoterResidual: wf.promoterResidual, insuficiente: totalDemand > poolFinal+0.01 };
@@ -1512,7 +1546,7 @@ const ValidationEngine = (function(){
     //    pois em waterfall os valores podem ser pro-rateados por insuficiência de fundos, por desenho)
     if(!cf.waterfallOn){
       project.investors.forEach(inv=>{
-        const nominal = InvestorEngine.computeWaterfallDemand(inv, cf.start, cf.monthCount, cf.resultadoAntesParticipacao);
+        const nominal = InvestorEngine.computeWaterfallDemand(inv, cf.start, cf.monthCount, cf.resultadoAntesParticipacao, project);
         const nominalTotal = nominal.suprimentos+nominal.capital+nominal.preferencial+nominal.lucro;
         const real = cf.investorDistBreakdown.find(x=>x.id===inv.id);
         const realTotal = real?(real.capitalDevolvido+real.remuneracao):0;
@@ -1674,7 +1708,8 @@ const ReportEngine = (function(){
     if(sections.rentabilidade){
       const cfInv = new Array(cf.monthCount).fill(0);
       (investor.contributions||[]).forEach(c=>{
-        const idx = Util.clamp(Util.monthIndex(c.data, cf.start),0,cf.monthCount-1);
+        const dataEfetiva = investorEffectiveContribDate(project, investor, c.data);
+        const idx = Util.clamp(Util.monthIndex(dataEfetiva, cf.start),0,cf.monthCount-1);
         cfInv[idx]-= c.valor||0;
       });
       const exitIdx = Util.clamp(Util.monthIndex(investor.dataSaidaPrevista, cf.start),0,cf.monthCount-1);
@@ -1759,8 +1794,8 @@ const StorageEngine = (function(){
             manualValores: Util.deepClone(c.manualValores||[]), percentuais: Util.deepClone(c.percentuais||[]),
             observacoes: c.observacoes||''
           };
-          if(categoriasConstrucao.includes(c.categoria)){ item.valorConstrucao = 0; project.construcaoCustos.push(item); }
-          else { item.valorCompra = 0; project.custosOutros.push(item); }
+          if(categoriasConstrucao.includes(c.categoria)){ item.valorConstrucao = item.valorVenda; project.construcaoCustos.push(item); }
+          else { item.valorCompra = item.valorVenda; project.custosOutros.push(item); }
         });
         project.costs = [];
         project.custosMigradosParaSubabas = true;
@@ -1770,9 +1805,17 @@ const StorageEngine = (function(){
     } else if(!project.custosMigradosParaSubabas){
       project.custosMigradosParaSubabas = true;
     }
+    // Auto-reparação: o valor de construção/compra nunca deve ficar a 0 ou por
+    // preencher — nesse caso, assume o valor de venda (aplica-se sempre que o
+    // projeto é carregado, por isso o valor fica gravado e não se perde ao mudar
+    // de aba nem entre sessões).
+    (project.construcaoCustos||[]).forEach(c=>{ if(!c.valorConstrucao) c.valorConstrucao = c.valorVenda||0; });
+    (project.custosOutros||[]).forEach(c=>{ if(!c.valorCompra) c.valorCompra = c.valorVenda||0; });
     (project.investors||[]).forEach(inv=>{
       if(inv.returnModel && inv.returnModel.penalizacaoSaidaAntecipada===undefined) inv.returnModel.penalizacaoSaidaAntecipada = null;
       if(inv.returnModel && inv.returnModel.premioPermanencia===undefined) inv.returnModel.premioPermanencia = null;
+      if(inv.categoriaNecessidade===undefined) inv.categoriaNecessidade = null;
+      if(inv.diasNecessidade===undefined) inv.diasNecessidade = 0;
     });
     return project;
   }
@@ -1814,7 +1857,7 @@ const NAV = [
   {id:'relatorios', label:'Relatórios', n:'14'},
 ];
 
-const UI = { activeView:'projetos', activeInvestorId:null, charts:{}, readOnly:false, tableSort:{} };
+const UI = { activeView:'projetos', activeInvestorId:null, charts:{}, readOnly:false, tableSort:{}, custoBasis:'venda', cashflowSubView:'geral' };
 
 // Pequeno ícone "(i)" a colocar ao lado do título de uma caixa de KPI, com uma
 // explicação/fórmula em texto (tooltip nativo ao passar o rato).
@@ -1967,7 +2010,7 @@ function renderTopbar(){
 function computeCF(){
   const p = Store.active();
   if(!p) return null;
-  return CashFlowEngine.build(p, Store.getScenario(), false);
+  return CashFlowEngine.build(p, Store.getScenario(), false, UI.custoBasis||'venda');
 }
 
 function renderContent(){
@@ -2356,7 +2399,9 @@ function custoConstrucaoEditorModal(cost, onSave){
       c.descricao = modalEl.querySelector('#cc_descricao').value;
       c.fornecedor = modalEl.querySelector('#cc_fornecedor').value;
       c.valorVenda = +modalEl.querySelector('#cc_valorVenda').value||0;
-      c.valorConstrucao = +modalEl.querySelector('#cc_valorConstrucao').value||0;
+      // Se o valor de construção não for preenchido (ou for 0), assume o valor de venda —
+      // nunca fica a 0, e fica gravado assim (não se perde ao mudar de aba).
+      c.valorConstrucao = +modalEl.querySelector('#cc_valorConstrucao').value || c.valorVenda || 0;
       c.temIVA = modalEl.querySelector('#cc_temIVA').checked;
       c.taxaIVA = (+modalEl.querySelector('#cc_taxaIVA').value||0)/100;
       c.ivaDedutivel = modalEl.querySelector('#cc_ivaDedutivel').value;
@@ -2557,7 +2602,9 @@ function custoOutroEditorModal(cost, onSave){
       c.descricao = modalEl.querySelector('#co_descricao').value;
       c.fornecedor = modalEl.querySelector('#co_fornecedor').value;
       c.valorVenda = +modalEl.querySelector('#co_valorVenda').value||0;
-      c.valorCompra = +modalEl.querySelector('#co_valorCompra').value||0;
+      // Se o valor de compra não for preenchido (ou for 0), assume o valor de venda —
+      // nunca fica a 0, e fica gravado assim (não se perde ao mudar de aba).
+      c.valorCompra = +modalEl.querySelector('#co_valorCompra').value || c.valorVenda || 0;
       c.temIVA = modalEl.querySelector('#co_temIVA').checked;
       c.taxaIVA = (+modalEl.querySelector('#co_taxaIVA').value||0)/100;
       c.ivaDedutivel = modalEl.querySelector('#co_ivaDedutivel').value;
@@ -2876,6 +2923,7 @@ function viewInvestidores(p, cf){
   const rows = p.investors.map(inv=>{
     const contrib = cf.investorContribBreakdown.find(x=>x.id===inv.id)||{total:0};
     const dist = cf.investorDistBreakdown.find(x=>x.id===inv.id)||{capitalDevolvido:0,remuneracao:0};
+    const dataNec = computeDataNecessidade(p, inv);
     return `<tr data-id="${inv.id}">
       <td>${Util.escapeHtml(inv.nome)}</td>
       <td>${Util.escapeHtml(inv.referencia||'')}</td>
@@ -2883,6 +2931,7 @@ function viewInvestidores(p, cf){
       <td>${inv.returnModel?inv.returnModel.tipo:'—'}</td>
       <td>${Util.fmtDate(inv.dataEntrada)}</td>
       <td>${inv.dataSaidaPrevista?Util.fmtDate(inv.dataSaidaPrevista):'<span class="tag warn">sem data</span>'}</td>
+      <td>${inv.categoriaNecessidade ? (dataNec?Util.fmtDate(dataNec):'<span class="tag warn">sem rubricas</span>') + ` <span style="color:var(--ink-faint);font-size:11px;">(${Util.escapeHtml(inv.categoriaNecessidade)})</span>` : '—'}</td>
       <td class="num mono">${Util.fmtMoney0(dist.capitalDevolvido+dist.remuneracao)}</td>
       <td class="row-actions">
         <button class="icon-btn" data-act="edit">Editar</button>
@@ -2891,12 +2940,12 @@ function viewInvestidores(p, cf){
     </tr>`;
   }).join('');
   return `
-  <div class="view-head"><div><h2>Investidores</h2><p>Cada investidor é independente, com a sua própria estrutura de entrada e modelo de retorno.</p></div>
+  <div class="view-head"><div><h2>Investidores</h2><p>Cada investidor é independente, com a sua própria estrutura de entrada e modelo de retorno. Se tiver uma "categoria necessária" definida, o cash-flow assume que o capital entra na data necessidade calculada, em vez das datas das entradas de capital.</p></div>
     <button class="tb-btn primary" id="btnAddInvestor">+ Adicionar investidor</button>
   </div>
   <div class="tbl-wrap"><table class="data">
-    <thead><tr><th>Nome</th><th>Referência</th><th class="num">Capital investido</th><th>Modelo</th><th>Entrada</th><th>Saída prevista</th><th class="num">Total previsto a receber</th><th></th></tr></thead>
-    <tbody>${rows||'<tr><td colspan="8" class="empty">Sem investidores registados.</td></tr>'}</tbody>
+    <thead><tr><th>Nome</th><th>Referência</th><th class="num">Capital investido</th><th>Modelo</th><th>Entrada</th><th>Saída prevista</th><th>Data necessidade</th><th class="num">Total previsto a receber</th><th></th></tr></thead>
+    <tbody>${rows||'<tr><td colspan="9" class="empty">Sem investidores registados.</td></tr>'}</tbody>
   </table></div>
   <div class="card"><h3>Waterfall de distribuição</h3>
     <p style="color:var(--ink-soft);font-size:12.5px;margin-top:-6px;">Quando ativo, todos os retornos de investidores e o residual do promotor são apurados num único acerto final, repartindo o valor disponível pela ordem de prioridades abaixo (as despesas e o serviço da dívida são sempre pagos em primeiro lugar, por serem custos obrigatórios). Quando inativo, cada investidor recebe segundo o seu próprio modelo de retorno, na sua data de saída individual.</p>
@@ -2909,7 +2958,7 @@ const WF_TIER_LABELS = {suprimentos:'3. Devolução de suprimentos', preferencia
 
 function investorEditorModal(investor, onSave){
   const isNew = !investor;
-  const inv = investor ? Util.deepClone(investor) : {id:Util.uid(),nome:'Novo Investidor',referencia:'',dataEntrada:Store.active().assumptions.dataInicio,dataSaidaPrevista:'',observacoes:'',contributions:[],returnModel:{tipo:'fixo',percentagem:0.2,percentagemAnual:0.15,percentagemMensal:0.015,percentagemLucro:0.2,retornoMinimo:null,retornoMaximo:null,hurdleRate:null,prazoMinimo:null,prazoMaximo:null,penalizacaoSaidaAntecipada:null,premioPermanencia:null,eventos:[]}};
+  const inv = investor ? Util.deepClone(investor) : {id:Util.uid(),nome:'Novo Investidor',referencia:'',dataEntrada:Store.active().assumptions.dataInicio,dataSaidaPrevista:'',observacoes:'',contributions:[],categoriaNecessidade:null,diasNecessidade:0,returnModel:{tipo:'fixo',percentagem:0.2,percentagemAnual:0.15,percentagemMensal:0.015,percentagemLucro:0.2,retornoMinimo:null,retornoMaximo:null,hurdleRate:null,prazoMinimo:null,prazoMaximo:null,penalizacaoSaidaAntecipada:null,premioPermanencia:null,eventos:[]}};
   const tiposContrib = ['capital_social','suprimentos','prestacoes'];
   const tiposRetorno = [
     ['fixo','A. Retorno fixo total'], ['anual','B. Retorno anual'], ['mensal','C. Retorno mensal'],
@@ -2926,6 +2975,16 @@ function investorEditorModal(investor, onSave){
     <div class="section-sub">Estrutura da entrada (capital comprometido)</div>
     <div id="contribRows"></div>
     <button class="icon-btn" id="addContrib">+ Adicionar entrada de capital</button>
+
+    <div class="section-sub">Data necessidade (opcional)${kpiInfo('Define quando o capital deste investidor tem de estar disponível: escolhe uma categoria de custo e um nº de dias de antecedência. A data necessidade = data de início dessa categoria − nº de dias. Se definida, o cash-flow passa a assumir que o dinheiro deste investidor entra nessa data, em vez das datas configuradas em cada entrada de capital.')}</div>
+    <div class="grid cols-3">
+      <div class="field"><label>Categoria necessária</label><select id="i_categoriaNecessidade">
+        <option value="">— Nenhuma (usa as datas das entradas) —</option>
+        ${Array.from(new Set(allProjectCosts(Store.active()||{construcaoCustos:[],custosOutros:[]}).map(c=>c.categoria).filter(Boolean))).map(cat=>`<option value="${Util.escapeHtml(cat)}" ${inv.categoriaNecessidade===cat?'selected':''}>${Util.escapeHtml(cat)}</option>`).join('')}
+      </select></div>
+      <div class="field"><label>Dias de antecedência</label><input type="number" id="i_diasNecessidade" value="${inv.diasNecessidade||0}"></div>
+      <div class="field"><label>Data necessidade calculada</label><div class="k-value" id="i_dataNecessidadePreview" style="font-size:15px;padding-top:6px;">—</div></div>
+    </div>
 
     <div class="section-sub">Modelo de retorno</div>
     <div class="field"><select id="i_tipoRetorno">${tiposRetorno.map(([v,l])=>`<option value="${v}" ${inv.returnModel.tipo===v?'selected':''}>${l}</option>`).join('')}</select></div>
@@ -2961,6 +3020,16 @@ function investorEditorModal(investor, onSave){
     }
     modalEl.querySelector('#addContrib').onclick = ()=>{ inv.contributions.push({id:Util.uid(),tipo:'capital_social',valor:0,data:inv.dataEntrada}); paintContrib(); };
     paintContrib();
+
+    const catNecEl = modalEl.querySelector('#i_categoriaNecessidade'), diasNecEl = modalEl.querySelector('#i_diasNecessidade');
+    function updateDataNecessidadePreview(){
+      const previewInv = {...inv, categoriaNecessidade: catNecEl.value||null, diasNecessidade: +diasNecEl.value||0};
+      const dn = Store.active() ? computeDataNecessidade(Store.active(), previewInv) : null;
+      modalEl.querySelector('#i_dataNecessidadePreview').textContent = dn ? Util.fmtDate(dn) : (catNecEl.value ? 'sem rubricas nessa categoria' : '—');
+    }
+    catNecEl.onchange = updateDataNecessidadePreview;
+    diasNecEl.oninput = updateDataNecessidadePreview;
+    updateDataNecessidadePreview();
 
     function renderRetornoParams(){
       const tipo = modalEl.querySelector('#i_tipoRetorno').value;
@@ -3004,6 +3073,8 @@ function investorEditorModal(investor, onSave){
       inv.referencia = modalEl.querySelector('#i_ref').value;
       inv.dataEntrada = modalEl.querySelector('#i_dataEntrada').value;
       inv.dataSaidaPrevista = modalEl.querySelector('#i_dataSaida').value||'';
+      inv.categoriaNecessidade = modalEl.querySelector('#i_categoriaNecessidade').value||null;
+      inv.diasNecessidade = +modalEl.querySelector('#i_diasNecessidade').value||0;
       const tipo = modalEl.querySelector('#i_tipoRetorno').value;
       inv.returnModel.tipo = tipo;
       if(tipo==='fixo') inv.returnModel.percentagem = (+modalEl.querySelector('#rp_perc').value||0)/100;
@@ -3109,21 +3180,42 @@ const CF_SAIDA_LABELS = {
   participacaoLucroInvestidores:'Participação nos lucros (investidores)', tributacao:'Tributação (IRC)',
   distribuicaoPromotor:'Distribuição final ao promotor (residual do projeto, se positivo)'
 };
+// Devolve os movimentos (entradas/saídas discriminadas) de um mês do cash-flow —
+// usado tanto no detalhe expansível da vista "Geral" como na vista "Flow necessidades".
+function cfMonthMovements(cf, i){
+  const ent = Object.keys(CF_ENTRADA_LABELS).map(k=>{
+    const arr = cf.led[k];
+    return {label:CF_ENTRADA_LABELS[k], v:(arr&&arr[i])||0, tipo:'entrada'};
+  }).filter(x=>Math.abs(x.v)>0.005);
+  const custosDetail = Object.keys(cf.led.custosPorCategoria).map(k=>({
+    label:'Custo — '+k, v:(cf.led.custosPorCategoria[k]&&cf.led.custosPorCategoria[k][i])||0, tipo:'saida'
+  })).filter(x=>Math.abs(x.v)>0.005);
+  const outrasSaidas = Object.keys(CF_SAIDA_LABELS).map(k=>{
+    const arr = k==='distribuicaoPromotor' ? cf.led.distribuicaoPromotor : cf.led[k];
+    return {label:CF_SAIDA_LABELS[k], v:(arr&&arr[i])||0, tipo:'saida'};
+  }).filter(x=>Math.abs(x.v)>0.005);
+  return [...ent, ...custosDetail, ...outrasSaidas];
+}
+function cashflowSubTabs(){
+  const sv = UI.cashflowSubView||'geral';
+  return `<div class="small-btn-row">
+    <button class="tb-btn ${sv==='geral'?'primary':''}" id="btnCfSubGeral">Cash-Flow</button>
+    <button class="tb-btn ${sv==='necessidades'?'primary':''}" id="btnCfSubNecessidades">Flow necessidades</button>
+    <span style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-soft);">Calcular pelo:
+      <select id="cfBasisSelect" style="width:auto;">
+        <option value="venda" ${UI.custoBasis!=='custo'?'selected':''}>Valor de venda</option>
+        <option value="custo" ${UI.custoBasis==='custo'?'selected':''}>Valor de custo (construção/compra)</option>
+      </select>
+    </span>
+  </div>`;
+}
 function viewCashflow(p, cf){
+  if((UI.cashflowSubView||'geral')==='necessidades') return viewCashflowNecessidades(p, cf);
   const labels = Array.from({length:cf.monthCount},(_,i)=>Util.monthLabel(cf.start,i));
   function detailRows(i){
-    const ent = Object.keys(CF_ENTRADA_LABELS).map(k=>{
-      const arr = cf.led[k];
-      return {label:CF_ENTRADA_LABELS[k], v:(arr&&arr[i])||0};
-    }).filter(x=>Math.abs(x.v)>0.005);
-    const custosDetail = Object.keys(cf.led.custosPorCategoria).map(k=>({
-      label:'Custo — '+k, v:(cf.led.custosPorCategoria[k]&&cf.led.custosPorCategoria[k][i])||0
-    })).filter(x=>Math.abs(x.v)>0.005);
-    const outrasSaidas = Object.keys(CF_SAIDA_LABELS).map(k=>{
-      const arr = k==='distribuicaoPromotor' ? cf.led.distribuicaoPromotor : cf.led[k];
-      return {label:CF_SAIDA_LABELS[k], v:(arr&&arr[i])||0};
-    }).filter(x=>Math.abs(x.v)>0.005);
-    const sai = [...custosDetail, ...outrasSaidas];
+    const mv = cfMonthMovements(cf, i);
+    const ent = mv.filter(x=>x.tipo==='entrada');
+    const sai = mv.filter(x=>x.tipo==='saida');
     return `<div class="grid cols-2" style="gap:14px;">
       <div><div class="section-sub">Origem das entradas</div>${ent.length?ent.map(x=>`<div style="display:flex;justify-content:space-between;padding:3px 0;font-size:12.5px;"><span>${Util.escapeHtml(x.label)}</span><span class="mono">${Util.fmtMoney0(x.v)}</span></div>`).join(''):'<div class="empty">Sem entradas este mês.</div>'}</div>
       <div><div class="section-sub">Destino das saídas (custos discriminados por categoria)</div>${sai.length?sai.map(x=>`<div style="display:flex;justify-content:space-between;padding:3px 0;font-size:12.5px;"><span>${Util.escapeHtml(x.label)}</span><span class="mono">${Util.fmtMoney0(x.v)}</span></div>`).join(''):'<div class="empty">Sem saídas este mês.</div>'}</div>
@@ -3139,7 +3231,8 @@ function viewCashflow(p, cf){
     </tr>
     <tr class="cf-detail-row" data-mi-detail="${i}" style="display:none;"><td colspan="5" style="background:var(--surface-alt);">${detailRows(i)}</td></tr>`).join('');
   return `
-  <div class="view-head"><div><h2>Cash-Flow Mensal</h2><p>Linha temporal completa do projeto, do primeiro ao último mês com movimento, apenas com o que foi introduzido (custos, vendas, financiamento, investidores) — o saldo pode ficar negativo se o projeto estiver, nesse momento, por financiar. No final, se sobrar saldo positivo, é distribuído ao promotor. Clica numa linha da tabela para ver o detalhe do mês. Cenário: <strong>${Store.getScenario()}</strong>.</p></div></div>
+  <div class="view-head"><div><h2>Cash-Flow Mensal</h2><p>Linha temporal completa do projeto, do primeiro ao último mês com movimento, apenas com o que foi introduzido (custos, vendas, financiamento, investidores) — o saldo pode ficar negativo se o projeto estiver, nesse momento, por financiar. No final, se sobrar saldo positivo, é distribuído ao promotor. Clica numa linha da tabela para ver o detalhe do mês. Cenário: <strong>${Store.getScenario()}</strong>. Cálculo pelo ${UI.custoBasis==='custo'?'valor de custo (construção/compra)':'valor de venda'} das rubricas de custos.</p></div></div>
+  ${cashflowSubTabs()}
   <div class="kpis">
     <div class="kpi"><div class="k-label">Necessidade de capital sem financiamento${kpiInfo('O maior défice de caixa que o projeto teria em qualquer mês, contando só com entradas de vendas (sem investidores nem banco). Fórmula: valor absoluto do mínimo do cash-flow acumulado, calculado antes de aplicar financiamento/investidores.')}</div><div class="k-value neg">${Util.fmtMoney0(cf.capitalNecessario)}</div><div class="k-sub">pior défice antes de investidores/banco — mês ${Util.monthLabel(cf.start,cf.mesPiorCapital)}</div></div>
     <div class="kpi"><div class="k-label">Pior saldo acumulado${kpiInfo('O ponto mais baixo do cash-flow acumulado real do projeto, já com investidores e financiamento bancário incluídos. Se for negativo, é um défice que fica por cobrir (o projeto já não injeta capital automático para o tapar). Fórmula: mínimo de cf.cfAcumulado.')}</div><div class="k-value ${Math.min(...cf.cfAcumulado)<-1?'neg':'pos'}">${Util.fmtMoney0(Math.min(...cf.cfAcumulado))}</div><div class="k-sub">com a estrutura de investidores/banco atual — mês ${Util.monthLabel(cf.start, cf.cfAcumulado.indexOf(Math.min(...cf.cfAcumulado)))}</div></div>
@@ -3153,13 +3246,42 @@ function viewCashflow(p, cf){
   </table></div>`;
 }
 
+// VISTA: "Flow necessidades" — livro-razão cronológico, uma linha por movimento
+// (entrada OU saída), com saldo acumulado linha a linha (estilo folha de cálculo).
+function viewCashflowNecessidades(p, cf){
+  const linhas = [];
+  for(let i=0;i<cf.monthCount;i++){
+    const dt = Util.addMonths(cf.start, i);
+    cfMonthMovements(cf, i).forEach(mv=> linhas.push({data:dt, ...mv}));
+  }
+  let saldo = 0;
+  const rowsHtml = linhas.map(r=>{
+    saldo += (r.tipo==='entrada' ? r.v : -r.v);
+    return `<tr>
+      <td class="mono">${Util.fmtDate(r.data)}</td>
+      <td class="num mono" style="color:var(--neg)">${r.tipo==='saida'?Util.fmtMoney0(r.v):''}</td>
+      <td class="num mono" style="color:var(--accent-ink)">${r.tipo==='entrada'?Util.fmtMoney0(r.v):''}</td>
+      <td>${Util.escapeHtml(r.label)}</td>
+      <td class="num mono" style="${saldo<0?'color:var(--neg);font-weight:600':''}">${Util.fmtMoney0(saldo)}</td>
+    </tr>`;
+  }).join('');
+  return `
+  <div class="view-head"><div><h2>Flow necessidades</h2><p>Todos os movimentos de dinheiro do projeto, um por linha, por ordem cronológica — como uma folha de caixa. Saldo acumulado linha a linha. Cálculo pelo ${UI.custoBasis==='custo'?'valor de custo (construção/compra)':'valor de venda'} das rubricas de custos.</p></div></div>
+  ${cashflowSubTabs()}
+  <div class="card"><h3>Cash-flow mensal e acumulado</h3><div class="chart-box"><canvas id="chartCFNecessidades"></canvas></div></div>
+  <div class="tbl-wrap"><table class="data">
+    <thead><tr><th>Data</th><th class="num">Saída</th><th class="num">Entrada</th><th>Categoria / Observações</th><th class="num">Saldo</th></tr></thead>
+    <tbody>${rowsHtml || '<tr><td colspan="5" class="empty">Sem movimentos registados.</td></tr>'}</tbody>
+  </table></div>`;
+}
+
 /* =========================================================================
    VIEW: CENÁRIOS
    ========================================================================= */
 function viewCenarios(p){
-  const cfBase = CashFlowEngine.build(p,'base',false);
-  const cfOti = CashFlowEngine.build(p,'otimista',false);
-  const cfPess = CashFlowEngine.build(p,'pessimista',false);
+  const cfBase = CashFlowEngine.build(p,'base',false,UI.custoBasis||'venda');
+  const cfOti = CashFlowEngine.build(p,'otimista',false,UI.custoBasis||'venda');
+  const cfPess = CashFlowEngine.build(p,'pessimista',false,UI.custoBasis||'venda');
   function kpiRow(label, fn, fmt){
     fmt = fmt||Util.fmtMoney0;
     return `<tr><td>${label}</td><td class="num mono">${fmt(fn(cfBase))}</td><td class="num mono">${fmt(fn(cfOti))}</td><td class="num mono">${fmt(fn(cfPess))}</td></tr>`;
@@ -3273,7 +3395,8 @@ function viewInvestidor(p, cf){
 
   const cfInv = new Array(cf.monthCount).fill(0);
   (inv.contributions||[]).forEach(c=>{
-    const idx = Util.clamp(Util.monthIndex(c.data, cf.start),0,cf.monthCount-1);
+    const dataEfetiva = investorEffectiveContribDate(p, inv, c.data);
+    const idx = Util.clamp(Util.monthIndex(dataEfetiva, cf.start),0,cf.monthCount-1);
     cfInv[idx]-= c.valor||0;
   });
   const exitIdx = inv.dataSaidaPrevista ? Util.clamp(Util.monthIndex(inv.dataSaidaPrevista, cf.start),0,cf.monthCount-1) : cf.monthCount-1;
@@ -3512,13 +3635,13 @@ function wireView(view, p, cf){
       };
       const moveBtn = tr.querySelector('[data-act="move"]');
       if(moveBtn) moveBtn.onclick = ()=>{
-        if(!confirm('Mover este custo para "Custos outros"? O valor de venda mantém-se; o valor de compra fica a 0.')) return;
+        if(!confirm('Mover este custo para "Custos outros"? O valor de venda mantém-se; o valor de compra assume o valor de venda (nunca fica a 0).')) return;
         Store.update(pr=>{
           const i = pr.construcaoCustos.findIndex(c=>c.id===id);
           if(i<0) return;
           const item = pr.construcaoCustos.splice(i,1)[0];
           delete item.valorConstrucao;
-          item.valorCompra = 0;
+          item.valorCompra = item.valorVenda||0;
           if(!pr.custosOutros) pr.custosOutros=[];
           pr.custosOutros.push(item);
         });
@@ -3555,13 +3678,13 @@ function wireView(view, p, cf){
       };
       const moveBtn = tr.querySelector('[data-act="move"]');
       if(moveBtn) moveBtn.onclick = ()=>{
-        if(!confirm('Mover este custo para "Custos construção"? O valor de venda mantém-se; o valor de construção fica a 0.')) return;
+        if(!confirm('Mover este custo para "Custos construção"? O valor de venda mantém-se; o valor de construção assume o valor de venda (nunca fica a 0).')) return;
         Store.update(pr=>{
           const i = pr.custosOutros.findIndex(c=>c.id===id);
           if(i<0) return;
           const item = pr.custosOutros.splice(i,1)[0];
           delete item.valorCompra;
-          item.valorConstrucao = 0;
+          item.valorConstrucao = item.valorVenda||0;
           if(!pr.construcaoCustos) pr.construcaoCustos=[];
           pr.construcaoCustos.push(item);
         });
@@ -3741,25 +3864,43 @@ function wireView(view, p, cf){
     });
   }
   if(view==='cashflow'){
-    document.querySelectorAll('#content tr.cf-row').forEach(tr=>{
-      tr.onclick = ()=>{
-        const mi = tr.dataset.mi;
-        const detail = document.querySelector(`#content tr.cf-detail-row[data-mi-detail="${mi}"]`);
-        if(!detail) return;
-        const open = detail.style.display !== 'none';
-        detail.style.display = open ? 'none' : 'table-row';
-        tr.querySelector('td').textContent = (open?'▸ ':'▾ ') + tr.querySelector('td').textContent.replace(/^[▸▾]\s*/,'');
-      };
-    });
+    const btnGeral = document.getElementById('btnCfSubGeral'), btnNec = document.getElementById('btnCfSubNecessidades');
+    if(btnGeral) btnGeral.onclick = ()=>{ UI.cashflowSubView='geral'; render(); };
+    if(btnNec) btnNec.onclick = ()=>{ UI.cashflowSubView='necessidades'; render(); };
+    const basisSel = document.getElementById('cfBasisSelect');
+    if(basisSel) basisSel.onchange = ()=>{ UI.custoBasis = basisSel.value; render(); };
     const labels = Array.from({length:cf.monthCount},(_,i)=>Util.monthLabel(cf.start,i));
-    UI.charts.cf = new Chart(document.getElementById('chartCF'), {
-      type:'bar',
-      data:{ labels, datasets:[
-        {type:'bar', label:'CF líquido', data:cf.cfLiquido, backgroundColor:cf.cfLiquido.map(v=>v<0?C.neg:C.accent)},
-        {type:'line', label:'CF acumulado', data:cf.cfAcumulado, borderColor:C.gold, backgroundColor:'transparent', tension:0.15, yAxisID:'y'}
-      ]},
-      options:{responsive:true, maintainAspectRatio:false, scales:{ x:{grid:{display:false}}, y:{grid:{color:C.grid}} }, plugins:{legend:{labels:{color:C.ink}}} }
-    });
+    if((UI.cashflowSubView||'geral')==='necessidades'){
+      const chartEl = document.getElementById('chartCFNecessidades');
+      if(chartEl) UI.charts.cf = new Chart(chartEl, {
+        type:'bar',
+        data:{ labels, datasets:[
+          {type:'bar', label:'CF líquido', data:cf.cfLiquido, backgroundColor:cf.cfLiquido.map(v=>v<0?C.neg:C.accent)},
+          {type:'line', label:'CF acumulado', data:cf.cfAcumulado, borderColor:C.gold, backgroundColor:'transparent', tension:0.15, yAxisID:'y'}
+        ]},
+        options:{responsive:true, maintainAspectRatio:false, scales:{ x:{grid:{display:false}}, y:{grid:{color:C.grid}} }, plugins:{legend:{labels:{color:C.ink}}} }
+      });
+    } else {
+      document.querySelectorAll('#content tr.cf-row').forEach(tr=>{
+        tr.onclick = ()=>{
+          const mi = tr.dataset.mi;
+          const detail = document.querySelector(`#content tr.cf-detail-row[data-mi-detail="${mi}"]`);
+          if(!detail) return;
+          const open = detail.style.display !== 'none';
+          detail.style.display = open ? 'none' : 'table-row';
+          tr.querySelector('td').textContent = (open?'▸ ':'▾ ') + tr.querySelector('td').textContent.replace(/^[▸▾]\s*/,'');
+        };
+      });
+      const chartEl = document.getElementById('chartCF');
+      if(chartEl) UI.charts.cf = new Chart(chartEl, {
+        type:'bar',
+        data:{ labels, datasets:[
+          {type:'bar', label:'CF líquido', data:cf.cfLiquido, backgroundColor:cf.cfLiquido.map(v=>v<0?C.neg:C.accent)},
+          {type:'line', label:'CF acumulado', data:cf.cfAcumulado, borderColor:C.gold, backgroundColor:'transparent', tension:0.15, yAxisID:'y'}
+        ]},
+        options:{responsive:true, maintainAspectRatio:false, scales:{ x:{grid:{display:false}}, y:{grid:{color:C.grid}} }, plugins:{legend:{labels:{color:C.ink}}} }
+      });
+    }
   }
   if(view==='cenarios'){
     document.getElementById('btnSaveScenarios').onclick = ()=>{
